@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Claims Web App</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Claims Web App</p>
+          <h1>Browser Version</h1>
+          <p class="hero-copy">First web version of your claims manager. It reads the same local claim data and gives you a browser dashboard to build from.</p>
+        </div>
+        <div class="search-card">
+          <label for="search-input">Search</label>
+          <div class="search-row">
+            <input id="search-input" type="text" placeholder="Claim id, customer, insurer, town">
+            <button id="refresh-button" type="button">Refresh</button>
+          </div>
+        </div>
+      </header>
+
+      <section class="summary-grid">
+        <article class="stat-card">
+          <span class="stat-label">All Claims</span>
+          <strong class="stat-value" id="stat-all">0</strong>
+        </article>
+        <article class="stat-card">
+          <span class="stat-label">Open Claims</span>
+          <strong class="stat-value" id="stat-open">0</strong>
+        </article>
+        <article class="stat-card">
+          <span class="stat-label">Closed Claims</span>
+          <strong class="stat-value" id="stat-closed">0</strong>
+        </article>
+      </section>
+
+      <section class="content-grid">
+        <div class="panel">
+          <div class="panel-head">
+            <div class="tab-row">
+              <button class="tab-button active" data-status="all" type="button">All Claims</button>
+              <button class="tab-button" data-status="open" type="button">Open Claims</button>
+              <button class="tab-button" data-status="closed" type="button">Closed Claims</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Job #</th>
+                  <th>Customer</th>
+                  <th>Insurance</th>
+                  <th>Claim #</th>
+                  <th>Town</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="claims-table-body"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <aside class="panel details-panel">
+          <div class="panel-head">
+            <h2>Claim Details</h2>
+          </div>
+          <div class="detail-list" id="detail-list">
+            <div class="empty-state">Select a claim to view details.</div>
+          </div>
+        </aside>
+      </section>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+  </html>
