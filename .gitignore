@@ -1,4 +1,6 @@
 claims_secrets.json
+sftp_profiles.json
 Backups/
 __pycache__/
 *.pyc
+sftp_keys/

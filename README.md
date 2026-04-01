@@ -2,6 +2,38 @@
 
 Local desktop app for tracking claim folders, open claims, and closed claims.
 
+## SFTP Transfer Tool
+
+This project also includes a small SFTP desktop utility for moving folders between PCs with the Windows OpenSSH client that already ships with Windows.
+
+Run it with:
+
+```powershell
+python sftp_transfer_tool.py
+```
+
+Or use:
+
+```powershell
+start_sftp_transfer_tool.bat
+```
+
+What it does:
+
+- Saves SFTP connection profiles in `sftp_profiles.json`
+- Generates an `ed25519` SSH keypair for you in `sftp_keys/`
+- Uploads a local folder to a remote folder over SFTP
+- Downloads a remote folder back to your PC
+- Shows the exact `sftp.exe` command and batch commands it runs so you can reuse the same flow in the claims manager app later
+
+For tomorrow's office-PC move:
+
+1. Enable **OpenSSH Server** on the new office PC.
+2. Copy the generated `.pub` key into that PC user's `authorized_keys`.
+3. Use this tool from home to upload your folders into a folder on the office PC.
+
+The tool uses key-based auth on purpose because it is the cleanest and safest way to automate SFTP from Python without adding extra third-party packages.
+
 ## What it does
 
 - Watches one or more folders you choose.
