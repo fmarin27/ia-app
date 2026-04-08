@@ -34,6 +34,40 @@ For tomorrow's office-PC move:
 
 The tool uses key-based auth on purpose because it is the cleanest and safest way to automate SFTP from Python without adding extra third-party packages.
 
+## Codex Bridge
+
+This project also includes a bridge app for coordinating work between the home PC and office PC through a synced folder such as Syncthing.
+
+Run it with:
+
+```powershell
+python codex_bridge.py
+```
+
+Or use:
+
+```powershell
+start_codex_bridge.bat
+```
+
+What it does:
+
+- Creates a shared chat timeline across both PCs
+- Tracks pending command requests and asks for approval before running them
+- Executes approved PowerShell commands on the receiving PC and writes the result back to the bridge
+- Publishes local project folders and local focus notes so both sides can stay on the same page
+- Stores local setup in `codex_bridge_config.json`
+
+Typical setup:
+
+1. Pick a shared bridge folder that Syncthing keeps in sync on both PCs.
+2. Run the bridge app on both PCs.
+3. Set one app's local node to `home` and the other to `office`.
+4. Add the project root folders each PC should publish.
+5. Send chat messages or command requests through the shared bridge UI.
+
+The bridge is intentionally approval-gated for command execution. A command request can be broad, but the receiving PC still asks you before it runs.
+
 ## What it does
 
 - Watches one or more folders you choose.

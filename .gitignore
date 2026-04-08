@@ -1,5 +1,6 @@
 claims_secrets.json
 sftp_profiles.json
+codex_bridge_config.json
 Backups/
 __pycache__/
 *.pyc
