@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import site
 import subprocess
+import sys
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -10,8 +12,17 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-
 APP_DIR = Path(__file__).resolve().parent
+USER_SITE = site.getusersitepackages()
+if USER_SITE and USER_SITE not in sys.path:
+    sys.path.append(USER_SITE)
+BRIDGE_VENDOR = APP_DIR / "bridge_vendor"
+if BRIDGE_VENDOR.exists() and str(BRIDGE_VENDOR) not in sys.path:
+    sys.path.insert(0, str(BRIDGE_VENDOR))
+
+import pystray
+from PIL import Image, ImageDraw
+
 CONFIG_FILE = APP_DIR / "codex_bridge_config.json"
 DEFAULT_BRIDGE_ROOT = Path.home() / "Syncthing" / "codex-bridge"
 POLL_INTERVAL_MS = 3_000
@@ -47,6 +58,10 @@ class CodexBridgeApp:
         self.latest_commands: list[dict] = []
         self.latest_projects: dict[str, dict] = {}
         self.latest_nodes: dict[str, dict] = {}
+        self.tray_icon: pystray.Icon | None = None
+        self.tray_thread: threading.Thread | None = None
+        self.tray_started = False
+        self.is_hidden_to_tray = False
 
         self.local_node_var = tk.StringVar(value=self.config.local_node)
         self.display_name_var = tk.StringVar(value=self.config.display_name)
@@ -62,6 +77,8 @@ class CodexBridgeApp:
 
         self._build_ui()
         self.ensure_bridge_dirs()
+        self.setup_tray()
+        self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
         self.refresh_all()
         self.root.after(POLL_INTERVAL_MS, self.poll_bridge)
 
@@ -123,6 +140,8 @@ class CodexBridgeApp:
         ttk.Label(header, text="Bridge Folder").grid(row=0, column=4, sticky="w")
         ttk.Entry(header, textvariable=self.bridge_root_var).grid(row=0, column=5, sticky="ew", padx=(6, 6))
         ttk.Button(header, text="Choose", command=self.choose_bridge_folder).grid(row=0, column=6, sticky="ew")
+        ttk.Button(header, text="Hide To Tray", command=self.hide_to_tray).grid(row=1, column=5, sticky="ew", pady=(8, 0), padx=(6, 6))
+        ttk.Button(header, text="Exit Bridge", command=self.exit_app).grid(row=1, column=6, sticky="ew", pady=(8, 0))
 
         controls = ttk.Frame(self.root, padding=(12, 0, 12, 12))
         controls.grid(row=1, column=0, sticky="nsew")
@@ -299,6 +318,56 @@ class CodexBridgeApp:
         parent.rowconfigure(0, weight=1)
         self.log_text = tk.Text(parent, wrap="word", state="disabled")
         self.log_text.grid(row=0, column=0, sticky="nsew")
+
+    def setup_tray(self) -> None:
+        if self.tray_started:
+            return
+        image = self.build_tray_image()
+        menu = pystray.Menu(
+            pystray.MenuItem("Show Bridge", self.on_tray_show),
+            pystray.MenuItem("Hide Bridge", self.on_tray_hide),
+            pystray.MenuItem("Exit Bridge", self.on_tray_exit),
+        )
+        self.tray_icon = pystray.Icon("codex-bridge", image, "Codex Bridge", menu)
+        self.tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
+        self.tray_thread.start()
+        self.tray_started = True
+
+    def build_tray_image(self) -> Image.Image:
+        image = Image.new("RGB", (64, 64), "#14213d")
+        draw = ImageDraw.Draw(image)
+        draw.rounded_rectangle((6, 6, 58, 58), radius=12, fill="#fca311")
+        draw.text((18, 18), "CB", fill="#14213d")
+        return image
+
+    def on_tray_show(self, icon: pystray.Icon | None = None, item: object | None = None) -> None:
+        self.root.after(0, self.show_from_tray)
+
+    def on_tray_hide(self, icon: pystray.Icon | None = None, item: object | None = None) -> None:
+        self.root.after(0, self.hide_to_tray)
+
+    def on_tray_exit(self, icon: pystray.Icon | None = None, item: object | None = None) -> None:
+        self.root.after(0, self.exit_app)
+
+    def show_from_tray(self) -> None:
+        self.is_hidden_to_tray = False
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+        self.status_var.set("Codex Bridge restored from tray.")
+
+    def hide_to_tray(self) -> None:
+        self.is_hidden_to_tray = True
+        self.root.withdraw()
+        self.status_var.set("Codex Bridge is still running in the system tray.")
+
+    def exit_app(self) -> None:
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+        self.root.destroy()
 
     def choose_bridge_folder(self) -> None:
         path = filedialog.askdirectory(title="Choose the synced bridge folder", initialdir=str(self.bridge_root()))

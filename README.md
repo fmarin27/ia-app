@@ -44,10 +44,18 @@ Run it with:
 python codex_bridge.py
 ```
 
-Or use:
+Or use the default launcher:
 
 ```powershell
 start_codex_bridge.bat
+```
+
+The default launcher now opens the newer Qt version with a nicer UI.
+
+You can also run it directly:
+
+```powershell
+start_codex_bridge_qt.bat
 ```
 
 What it does:
