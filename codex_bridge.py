@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import site
 import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -20,11 +23,19 @@ BRIDGE_VENDOR = APP_DIR / "bridge_vendor"
 if BRIDGE_VENDOR.exists() and str(BRIDGE_VENDOR) not in sys.path:
     sys.path.insert(0, str(BRIDGE_VENDOR))
 
-import pystray
-from PIL import Image, ImageDraw
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    TRAY_AVAILABLE = True
+except Exception:
+    pystray = None
+    Image = None
+    ImageDraw = None
+    TRAY_AVAILABLE = False
 
 CONFIG_FILE = APP_DIR / "codex_bridge_config.json"
 DEFAULT_BRIDGE_ROOT = Path.home() / "Syncthing" / "codex-bridge"
+SECRETS_FILE = Path.home() / ".codex_bridge_secrets.json"
 POLL_INTERVAL_MS = 3_000
 
 
@@ -44,6 +55,8 @@ class BridgeConfig:
     project_roots: list[str] = field(default_factory=list)
     focus_project: str = ""
     focus_note: str = ""
+    auto_reply_enabled: bool = False
+    auto_reply_model: str = "gpt-4.1-mini"
 
 
 class CodexBridgeApp:
@@ -54,6 +67,7 @@ class CodexBridgeApp:
 
         self.config = self.load_config()
         self.active_commands: set[str] = set()
+        self.active_auto_replies: set[str] = set()
         self.latest_messages: list[dict] = []
         self.latest_commands: list[dict] = []
         self.latest_projects: dict[str, dict] = {}
@@ -73,7 +87,10 @@ class CodexBridgeApp:
         self.command_workdir_var = tk.StringVar()
         self.command_requires_approval_var = tk.BooleanVar(value=True)
         self.command_summary_var = tk.StringVar()
-        self.status_var = tk.StringVar(value="Configure the shared bridge folder, then keep the app open on both PCs.")
+        self.auto_reply_enabled_var = tk.BooleanVar(value=self.config.auto_reply_enabled)
+        self.auto_reply_model_var = tk.StringVar(value=self.config.auto_reply_model)
+        tray_note = "" if TRAY_AVAILABLE else " Tray support is unavailable on this Python build, so closing the window will exit the bridge."
+        self.status_var = tk.StringVar(value="Configure the shared bridge folder, then keep the app open on both PCs." + tray_note)
 
         self._build_ui()
         self.ensure_bridge_dirs()
@@ -98,6 +115,8 @@ class CodexBridgeApp:
         self.config.focus_project = self.focus_project_var.get().strip()
         self.config.focus_note = self.focus_note_text.get("1.0", "end").strip()
         self.config.project_roots = list(self.project_roots_list.get(0, "end"))
+        self.config.auto_reply_enabled = bool(self.auto_reply_enabled_var.get())
+        self.config.auto_reply_model = self.auto_reply_model_var.get().strip() or "gpt-4.1-mini"
         CONFIG_FILE.write_text(json.dumps(asdict(self.config), indent=2), encoding="utf-8")
 
     def default_display_name(self, node: str) -> str:
@@ -298,8 +317,16 @@ class CodexBridgeApp:
         ttk.Combobox(top, textvariable=self.local_node_var, values=("home", "office"), state="readonly").grid(row=1, column=1, sticky="w", padx=(6, 0), pady=(8, 0))
         ttk.Button(top, text="Save Setup", command=self.save_setup).grid(row=1, column=2, sticky="e", pady=(8, 0))
 
+        auto_frame = ttk.LabelFrame(parent, text="Auto Reply", padding=8)
+        auto_frame.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        auto_frame.columnconfigure(1, weight=1)
+        ttk.Checkbutton(auto_frame, text="Reply automatically to new chat messages targeted to this node", variable=self.auto_reply_enabled_var).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(auto_frame, text="Model").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(auto_frame, textvariable=self.auto_reply_model_var).grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=(8, 0))
+        ttk.Label(auto_frame, text="Tip: use chat target 'home' or 'office' for auto replies. API key is read from OPENAI_API_KEY or ~/.codex_bridge_secrets.json.").grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
         roots_frame = ttk.LabelFrame(parent, text="Local Project Roots To Publish", padding=8)
-        roots_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        roots_frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
         roots_frame.columnconfigure(0, weight=1)
         roots_frame.rowconfigure(0, weight=1)
 
@@ -320,6 +347,8 @@ class CodexBridgeApp:
         self.log_text.grid(row=0, column=0, sticky="nsew")
 
     def setup_tray(self) -> None:
+        if not TRAY_AVAILABLE:
+            return
         if self.tray_started:
             return
         image = self.build_tray_image()
@@ -334,6 +363,8 @@ class CodexBridgeApp:
         self.tray_started = True
 
     def build_tray_image(self) -> Image.Image:
+        if not TRAY_AVAILABLE or Image is None or ImageDraw is None:
+            raise RuntimeError("Tray icons are not available on this system.")
         image = Image.new("RGB", (64, 64), "#14213d")
         draw = ImageDraw.Draw(image)
         draw.rounded_rectangle((6, 6, 58, 58), radius=12, fill="#fca311")
@@ -357,6 +388,10 @@ class CodexBridgeApp:
         self.status_var.set("Codex Bridge restored from tray.")
 
     def hide_to_tray(self) -> None:
+        if not TRAY_AVAILABLE:
+            self.status_var.set("Tray support is unavailable on this Python build. Leaving the bridge window open will keep it running.")
+            messagebox.showinfo("Tray Unavailable", "Tray support is unavailable on this Python build. Leave the bridge window open to keep it running.")
+            return
         self.is_hidden_to_tray = True
         self.root.withdraw()
         self.status_var.set("Codex Bridge is still running in the system tray.")
@@ -412,6 +447,148 @@ class CodexBridgeApp:
             return
         self.project_roots_list.delete(selection[0])
 
+    def load_secrets(self) -> dict:
+        if not SECRETS_FILE.exists():
+            return {}
+        try:
+            return json.loads(SECRETS_FILE.read_text(encoding="utf-8-sig"))
+        except Exception:
+            return {}
+
+    def current_api_key(self) -> str:
+        return os.environ.get("OPENAI_API_KEY", "").strip() or str(self.load_secrets().get("openai_api_key", "")).strip()
+
+    def auto_reply_state_path(self) -> Path:
+        local_node = self.local_node_var.get().strip() or "home"
+        return self.state_dir() / f"{local_node}_auto_reply_state.json"
+
+    def load_auto_reply_state(self) -> dict:
+        path = self.auto_reply_state_path()
+        if not path.exists():
+            return {"initialized": False, "handled_ids": [], "updated_at": now_iso()}
+        try:
+            return json.loads(path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            return {"initialized": False, "handled_ids": [], "updated_at": now_iso()}
+
+    def save_auto_reply_state(self, state: dict) -> None:
+        self.write_json(self.auto_reply_state_path(), state)
+
+    def recent_chat_context(self, limit: int = 12) -> str:
+        lines: list[str] = []
+        for item in self.latest_messages[-limit:]:
+            if item.get("kind") != "chat":
+                continue
+            sender = item.get("sender_name") or item.get("sender") or "unknown"
+            lines.append(f"{sender}: {item.get('text', '')}")
+        return "\n".join(lines).strip()
+
+    def request_auto_reply(self, message: dict) -> str:
+        api_key = self.current_api_key()
+        if not api_key:
+            raise RuntimeError("No OpenAI API key configured for bridge auto reply.")
+
+        local_node = self.local_node_var.get().strip() or "home"
+        model = self.auto_reply_model_var.get().strip() or "gpt-4.1-mini"
+        sender_name = message.get("sender_name") or message.get("sender") or "Remote User"
+        sender_node = message.get("sender") or self.opposite_node(local_node)
+        system_prompt = (
+            f"You are {self.display_name_var.get().strip() or self.default_display_name(local_node)} running on the {local_node} PC "
+            "through Codex Bridge. Reply helpfully and concisely to the other PC. "
+            "Do not claim you executed commands or changed files unless that actually happened. "
+            "If you need the user to target a different node or approve a command, say so plainly."
+        )
+        user_prompt = (
+            f"Recent bridge chat:\n{self.recent_chat_context() or '(no recent chat)'}\n\n"
+            f"New message for you from {sender_name} on the {sender_node} PC:\n{message.get('text', '')}\n\n"
+            "Reply as a practical teammate in 2-6 sentences unless more detail is needed."
+        )
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.2,
+        }
+        request = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=90) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        content = body["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            return "\n".join(part.get("text", "") for part in content if isinstance(part, dict)).strip()
+        return str(content).strip()
+
+    def auto_reply_to_messages(self) -> None:
+        if not self.auto_reply_enabled_var.get():
+            return
+        local_node = self.local_node_var.get().strip() or "home"
+        state = self.load_auto_reply_state()
+        handled_ids = set(state.get("handled_ids", []))
+        incoming = [
+            item for item in self.latest_messages
+            if item.get("kind") == "chat"
+            and item.get("sender") not in ("", None, local_node)
+            and item.get("target") == local_node
+        ]
+        if not state.get("initialized"):
+            state["initialized"] = True
+            state["handled_ids"] = sorted({item.get("id") for item in incoming if item.get("id")})
+            state["updated_at"] = now_iso()
+            self.save_auto_reply_state(state)
+            return
+        for item in incoming:
+            message_id = item.get("id")
+            if not message_id or message_id in handled_ids or message_id in self.active_auto_replies:
+                continue
+            self.active_auto_replies.add(message_id)
+            thread = threading.Thread(target=self.generate_auto_reply, args=(item,), daemon=True)
+            thread.start()
+            break
+
+    def generate_auto_reply(self, message: dict) -> None:
+        message_id = message.get("id")
+        try:
+            reply_text = self.request_auto_reply(message)
+            if not reply_text:
+                raise RuntimeError("Model returned an empty reply.")
+            response = {
+                "id": make_id("msg"),
+                "kind": "chat",
+                "sender": self.local_node_var.get().strip() or "home",
+                "sender_name": self.display_name_var.get().strip() or self.default_display_name(self.local_node_var.get()),
+                "target": message.get("sender") or self.opposite_node(self.local_node_var.get().strip() or "home"),
+                "text": reply_text,
+                "reply_to": message_id,
+                "created_at": now_iso(),
+            }
+            path = self.messages_dir() / f"{response['created_at'].replace(':', '').replace('-', '')}_{response['id']}.json"
+            self.write_json(path, response)
+            self.root.after(0, lambda: self.status_var.set("Auto reply sent."))
+        except Exception as exc:
+            self.log(f"Auto reply failed: {exc}")
+            self.root.after(0, lambda: self.status_var.set("Auto reply failed. Check the Log tab."))
+        finally:
+            state = self.load_auto_reply_state()
+            handled_ids = set(state.get("handled_ids", []))
+            if message_id:
+                handled_ids.add(message_id)
+            state["initialized"] = True
+            state["handled_ids"] = sorted(handled_ids)
+            state["updated_at"] = now_iso()
+            self.save_auto_reply_state(state)
+            if message_id in self.active_auto_replies:
+                self.active_auto_replies.remove(message_id)
+            self.root.after(0, self.refresh_all)
+
     def write_json(self, path: Path, payload: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = path.with_suffix(path.suffix + ".tmp")
@@ -424,7 +601,7 @@ class CodexBridgeApp:
             return items
         for path in sorted(directory.glob("*.json")):
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload = json.loads(path.read_text(encoding="utf-8-sig"))
                 payload["_path"] = str(path)
                 items.append(payload)
             except Exception:
@@ -799,6 +976,7 @@ class CodexBridgeApp:
         self.refresh_commands_view()
         self.refresh_projects_view()
         self.auto_run_approved_commands()
+        self.auto_reply_to_messages()
 
     def poll_bridge(self) -> None:
         try:

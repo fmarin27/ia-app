@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
+import sys
 import tempfile
 import threading
 from dataclasses import asdict, dataclass
@@ -30,11 +32,119 @@ class SftpProfile:
     local_download_folder: str = ""
 
 
+class SftpTransferRunner:
+    def validate_profile(self, profile: SftpProfile, mode: str) -> str:
+        if not SFTP_EXE.exists():
+            return f"Could not find {SFTP_EXE}"
+        if not profile.host:
+            return "Host / IP is required."
+        if not profile.username:
+            return "Username is required."
+        if not profile.identity_file:
+            return "Choose or generate a private key first."
+        if not Path(profile.identity_file).exists():
+            return "The selected private key file does not exist."
+        if mode == "upload":
+            if not profile.local_upload_folder:
+                return "Choose a local upload folder."
+            if not Path(profile.local_upload_folder).exists():
+                return "The local upload folder does not exist."
+            if not profile.upload_remote_dir:
+                return "Remote Upload Dir is required."
+        else:
+            if not profile.local_download_folder:
+                return "Choose a local download folder."
+            if not Path(profile.local_download_folder).exists():
+                return "The local download folder does not exist."
+            if not profile.download_remote_path:
+                return "Remote Download Path is required."
+        return ""
+
+    def build_batch_contents(self, profile: SftpProfile, mode: str) -> str:
+        if mode == "upload":
+            remote_dir = self.normalize_remote(profile.upload_remote_dir)
+            local_folder = Path(profile.local_upload_folder)
+            commands = [
+                *self.mkdir_commands(remote_dir),
+                f'cd "{remote_dir}"',
+                f'put -R "{self.to_sftp_local_path(local_folder)}"',
+            ]
+        else:
+            remote_path = self.normalize_remote(profile.download_remote_path)
+            local_dir = Path(profile.local_download_folder)
+            commands = [
+                f'lcd "{self.to_sftp_local_path(local_dir)}"',
+                f'get -R "{remote_path}"',
+            ]
+        return "\n".join(commands) + "\n"
+
+    def normalize_remote(self, remote_path: str) -> str:
+        text = remote_path.strip().replace("\\", "/")
+        if not text.startswith("/"):
+            text = "/" + text
+        return str(PurePosixPath(text))
+
+    def mkdir_commands(self, remote_dir: str) -> list[str]:
+        path = PurePosixPath(remote_dir)
+        commands: list[str] = []
+        current = PurePosixPath("/")
+        for part in path.parts[1:]:
+            current = current / part
+            commands.append(f'mkdir "{current.as_posix()}"')
+        return commands
+
+    def to_sftp_local_path(self, path: Path) -> str:
+        return path.resolve().as_posix()
+
+    def render_command(self, command: list[str]) -> str:
+        return " ".join(f'"{item}"' if " " in item else item for item in command)
+
+    def execute_transfer(self, profile: SftpProfile, mode: str) -> tuple[list[str], int]:
+        validation_error = self.validate_profile(profile, mode)
+        if validation_error:
+            raise ValueError(validation_error)
+
+        logs: list[str] = []
+        batch_path: Path | None = None
+        try:
+            batch_contents = self.build_batch_contents(profile, mode)
+            logs.append("SFTP batch commands:\n" + batch_contents)
+            with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as batch_file:
+                batch_file.write(batch_contents)
+                batch_path = Path(batch_file.name)
+
+            command = [
+                str(SFTP_EXE),
+                "-i",
+                profile.identity_file,
+                "-P",
+                str(profile.port),
+                "-b",
+                str(batch_path),
+                "-oBatchMode=yes",
+                "-oStrictHostKeyChecking=accept-new",
+                f"{profile.username}@{profile.host}",
+            ]
+            logs.append("Running command:\n" + self.render_command(command))
+            result = subprocess.run(command, capture_output=True, text=True)
+            combined_output = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part)
+            if combined_output:
+                logs.append(combined_output)
+            return logs, result.returncode
+        finally:
+            if batch_path and batch_path.exists():
+                try:
+                    batch_path.unlink()
+                except OSError:
+                    pass
+
+
 class SftpTransferApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Fernando SFTP Transfer Tool")
         self.root.geometry("1180x780")
+        self.runner = SftpTransferRunner()
 
         self.profiles = self.load_profiles()
         self.profile_names = sorted(self.profiles) or ["Office PC"]
@@ -342,59 +452,14 @@ class SftpTransferApp:
         thread.start()
 
     def validate_profile(self, profile: SftpProfile, mode: str) -> str:
-        if not SFTP_EXE.exists():
-            return f"Could not find {SFTP_EXE}"
-        if not profile.host:
-            return "Host / IP is required."
-        if not profile.username:
-            return "Username is required."
-        if not profile.identity_file:
-            return "Choose or generate a private key first."
-        if not Path(profile.identity_file).exists():
-            return "The selected private key file does not exist."
-        if mode == "upload":
-            if not profile.local_upload_folder:
-                return "Choose a local upload folder."
-            if not Path(profile.local_upload_folder).exists():
-                return "The local upload folder does not exist."
-            if not profile.upload_remote_dir:
-                return "Remote Upload Dir is required."
-        else:
-            if not profile.local_download_folder:
-                return "Choose a local download folder."
-            if not Path(profile.local_download_folder).exists():
-                return "The local download folder does not exist."
-            if not profile.download_remote_path:
-                return "Remote Download Path is required."
-        return ""
+        return self.runner.validate_profile(profile, mode)
 
     def _run_transfer_worker(self, profile: SftpProfile, mode: str) -> None:
-        batch_path: Path | None = None
         try:
-            batch_contents = self.build_batch_contents(profile, mode)
-            self.log("SFTP batch commands:\n" + batch_contents)
-            with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as batch_file:
-                batch_file.write(batch_contents)
-                batch_path = Path(batch_file.name)
-
-            command = [
-                str(SFTP_EXE),
-                "-i",
-                profile.identity_file,
-                "-P",
-                str(profile.port),
-                "-b",
-                str(batch_path),
-                "-oBatchMode=yes",
-                "-oStrictHostKeyChecking=accept-new",
-                f"{profile.username}@{profile.host}",
-            ]
-            self.log("Running command:\n" + self.render_command(command))
-            result = subprocess.run(command, capture_output=True, text=True)
-            combined_output = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part)
-            if combined_output:
-                self.log(combined_output)
-            if result.returncode != 0:
+            logs, returncode = self.runner.execute_transfer(profile, mode)
+            for message in logs:
+                self.log(message)
+            if returncode != 0:
                 raise RuntimeError("SFTP transfer failed. Check the transfer log for details.")
             self.root.after(0, lambda: self.status_var.set(f"{mode.capitalize()} finished successfully."))
             self.root.after(0, lambda: messagebox.showinfo("Transfer Complete", f"{mode.capitalize()} finished successfully."))
@@ -402,54 +467,25 @@ class SftpTransferApp:
             self.root.after(0, lambda: self.status_var.set(str(exc)))
             self.root.after(0, lambda: messagebox.showerror("Transfer Failed", str(exc)))
         finally:
-            if batch_path and batch_path.exists():
-                try:
-                    batch_path.unlink()
-                except OSError:
-                    pass
             self.root.after(0, self.finish_transfer)
 
     def finish_transfer(self) -> None:
         self.is_running = False
 
     def build_batch_contents(self, profile: SftpProfile, mode: str) -> str:
-        if mode == "upload":
-            remote_dir = self.normalize_remote(profile.upload_remote_dir)
-            local_folder = Path(profile.local_upload_folder)
-            commands = [
-                *self.mkdir_commands(remote_dir),
-                f'cd "{remote_dir}"',
-                f'put -R "{self.to_sftp_local_path(local_folder)}"',
-            ]
-        else:
-            remote_path = self.normalize_remote(profile.download_remote_path)
-            local_dir = Path(profile.local_download_folder)
-            commands = [
-                f'lcd "{self.to_sftp_local_path(local_dir)}"',
-                f'get -R "{remote_path}"',
-            ]
-        return "\n".join(commands) + "\n"
+        return self.runner.build_batch_contents(profile, mode)
 
     def normalize_remote(self, remote_path: str) -> str:
-        text = remote_path.strip().replace("\\", "/")
-        if not text.startswith("/"):
-            text = "/" + text
-        return str(PurePosixPath(text))
+        return self.runner.normalize_remote(remote_path)
 
     def mkdir_commands(self, remote_dir: str) -> list[str]:
-        path = PurePosixPath(remote_dir)
-        commands: list[str] = []
-        current = PurePosixPath("/")
-        for part in path.parts[1:]:
-            current = current / part
-            commands.append(f'mkdir "{current.as_posix()}"')
-        return commands
+        return self.runner.mkdir_commands(remote_dir)
 
     def to_sftp_local_path(self, path: Path) -> str:
-        return path.resolve().as_posix()
+        return self.runner.to_sftp_local_path(path)
 
     def render_command(self, command: list[str]) -> str:
-        return " ".join(f'"{item}"' if " " in item else item for item in command)
+        return self.runner.render_command(command)
 
     def log(self, message: str) -> None:
         def write() -> None:
@@ -497,7 +533,79 @@ class SftpTransferApp:
         )
 
 
+def load_profiles_file() -> dict[str, SftpProfile]:
+    if not PROFILES_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(PROFILES_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return {name: SftpProfile(**data) for name, data in raw.items()}
+
+
+def build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Upload or download folders over SFTP with a saved profile or explicit paths.")
+    subparsers = parser.add_subparsers(dest="command")
+
+    for mode in ("download", "upload"):
+        command_parser = subparsers.add_parser(mode, help=f"{mode.capitalize()} a folder using SFTP.")
+        command_parser.add_argument("source", help="Remote folder/path for downloads, local folder for uploads.")
+        command_parser.add_argument("destination", help="Local folder for downloads, remote folder for uploads.")
+        command_parser.add_argument("--profile", default="Office PC", help="Saved profile name to use as the base settings.")
+        command_parser.add_argument("--host", help="Override host or IP address.")
+        command_parser.add_argument("--port", type=int, help="Override SSH port.")
+        command_parser.add_argument("--username", help="Override SSH username.")
+        command_parser.add_argument("--identity-file", help="Override private key path.")
+
+    return parser
+
+
+def profile_for_cli(args: argparse.Namespace) -> SftpProfile:
+    profiles = load_profiles_file()
+    profile = profiles.get(args.profile, SftpProfile(name=args.profile))
+    if args.host:
+        profile.host = args.host
+    if args.port:
+        profile.port = args.port
+    if args.username:
+        profile.username = args.username
+    if args.identity_file:
+        profile.identity_file = args.identity_file
+    if args.command == "download":
+        profile.download_remote_path = args.source
+        profile.local_download_folder = args.destination
+    else:
+        profile.local_upload_folder = args.source
+        profile.upload_remote_dir = args.destination
+    return profile
+
+
+def run_cli(args: argparse.Namespace) -> int:
+    runner = SftpTransferRunner()
+    profile = profile_for_cli(args)
+    print(f"Starting {args.command} using profile '{profile.name}'.")
+    try:
+        logs, returncode = runner.execute_transfer(profile, args.command)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    for message in logs:
+        print(message)
+        print()
+    if returncode != 0:
+        print("SFTP transfer failed.", file=sys.stderr)
+        return returncode
+    print(f"{args.command.capitalize()} finished successfully.")
+    return 0
+
+
 def main() -> None:
+    parser = build_cli_parser()
+    args = parser.parse_args()
+    if args.command:
+        raise SystemExit(run_cli(args))
+
     root = tk.Tk()
     style = ttk.Style(root)
     if "vista" in style.theme_names():
