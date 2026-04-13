@@ -12,24 +12,28 @@ import {
   FlatList,
   Linking,
   Modal,
+  Platform,
   Pressable,
   SafeAreaView,
   ScrollView,
   StyleSheet,
+  StatusBar as NativeStatusBar,
   Text,
   TextInput,
   View,
 } from "react-native";
-import { StatusBar } from "expo-status-bar";
+import { StatusBar as ExpoStatusBar } from "expo-status-bar";
 import * as ImagePicker from "expo-image-picker";
 import * as ImageManipulator from "expo-image-manipulator";
 import * as Updates from "expo-updates";
+import appConfig from "./app.json";
 
 const API_BASE_DEFAULT = "https://api.luxuryimportsusa.shop";
 const BULLET = " | ";
 const API_BASE_STORAGE_KEY = "claim_manager_mobile_api_base";
 const ROUTE_PLAN_STORAGE_KEY = "claim_manager_mobile_route_plan_keys";
 const ROUTE_ADDRESS_OVERRIDES_STORAGE_KEY = "claim_manager_mobile_route_address_overrides";
+const APP_VERSION = appConfig?.expo?.version || "unknown";
 
 const HOME_TABS = [
   ["claims", "Claims"],
@@ -146,6 +150,11 @@ export default function App() {
   const [apiReady, setApiReady] = useState(false);
   const loadSequence = useRef(0);
   const deferredSearch = useDeferredValue(search);
+  const currentChannel = Updates.channel || "preview";
+  const currentRuntimeVersion = Updates.runtimeVersion || APP_VERSION;
+  const currentUpdateId = Updates.updateId ? Updates.updateId.slice(0, 8) : "embedded";
+  const currentVersionLabel = `v${APP_VERSION} / ${currentChannel} / ${currentUpdateId}`;
+  const currentVersionDetail = `Runtime ${currentRuntimeVersion}`;
   const listPerfProps = {
     initialNumToRender: 10,
     maxToRenderPerBatch: 10,
@@ -306,7 +315,7 @@ export default function App() {
       }
       const result = await Updates.checkForUpdateAsync();
       if (!result.isAvailable) {
-        setUpdateMessage("No update is available right now.");
+        setUpdateMessage(`No update is available right now. ${currentVersionLabel}`);
         return;
       }
       await Updates.fetchUpdateAsync();
@@ -723,7 +732,7 @@ export default function App() {
 
   return (
     <SafeAreaView style={styles.safe}>
-      <StatusBar style="dark" />
+      <ExpoStatusBar style="dark" />
       <View style={styles.shell}>
         <View style={styles.headerTop}>
           <View style={styles.header}>
@@ -732,6 +741,8 @@ export default function App() {
             <Text style={styles.subtitle}>
               Field access for claims, files, notes, routes, and photo upload.
             </Text>
+            <Text style={styles.versionText}>{currentVersionLabel}</Text>
+            <Text style={styles.versionSubtext}>{currentVersionDetail}</Text>
           </View>
           <Pressable style={styles.ghostBtn} onPress={() => setUtilityOpen(true)}>
             <Text style={styles.ghostBtnText}>Settings</Text>
@@ -842,6 +853,8 @@ export default function App() {
 
             <View style={styles.utilityCard}>
               <Text style={styles.utilityHint}>Use the secure Cloudflare address by default, or switch back to local if you are on the same network.</Text>
+              <Text style={styles.helperStrong}>{currentVersionLabel}</Text>
+              <Text style={styles.helper}>{currentVersionDetail}</Text>
               <TextInput
                 value={apiBase}
                 onChangeText={setApiBase}
@@ -1313,7 +1326,7 @@ const styles = StyleSheet.create({
   shell: {
     flex: 1,
     paddingHorizontal: 14,
-    paddingTop: 6,
+    paddingTop: Platform.OS === "android" ? (NativeStatusBar.currentHeight || 0) + 8 : 6,
     paddingBottom: 0,
     gap: 6,
   },
@@ -1343,6 +1356,17 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: "#5d718d",
     lineHeight: 16,
+  },
+  versionText: {
+    marginTop: 6,
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#b42318",
+  },
+  versionSubtext: {
+    fontSize: 10,
+    color: "#6a7f9d",
+    fontWeight: "700",
   },
   card: {
     backgroundColor: "#ffffff",
@@ -1482,6 +1506,11 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: "#6e84a3",
     lineHeight: 18,
+  },
+  helperStrong: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#183659",
   },
   input: {
     borderWidth: 1,

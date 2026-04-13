@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import sys
+import threading
 from dataclasses import asdict
 from datetime import datetime
 from email.parser import BytesParser
@@ -33,6 +34,16 @@ PHOTO_EXTENSIONS = {
     ".webp": "image/webp",
 }
 ASSIGNMENT_MEASUREMENT_CACHE: dict[str, tuple[float, int, bool, str]] = {}
+MEASUREMENT_SCAN_STATUS = {
+    "running": False,
+    "started_at": "",
+    "completed_at": "",
+    "claims_scanned": 0,
+    "claims_with_assignment": 0,
+    "claims_flagged": 0,
+    "last_error": "",
+}
+MEASUREMENT_SCAN_LOCK = threading.Lock()
 
 
 def iso_timestamp(path: Path) -> str:
@@ -167,6 +178,75 @@ def claim_needs_measurement_photos(claim) -> tuple[bool, str]:
     return needs_measurement, matched_phrase
 
 
+def measurement_scan_snapshot() -> dict:
+    with MEASUREMENT_SCAN_LOCK:
+        return dict(MEASUREMENT_SCAN_STATUS)
+
+
+def _run_measurement_scan(repository: ClaimsRepository, force: bool = False) -> None:
+    started_at = datetime.now().isoformat(timespec="seconds")
+    with MEASUREMENT_SCAN_LOCK:
+        MEASUREMENT_SCAN_STATUS.update(
+            {
+                "running": True,
+                "started_at": started_at,
+                "completed_at": "",
+                "claims_scanned": 0,
+                "claims_with_assignment": 0,
+                "claims_flagged": 0,
+                "last_error": "",
+            }
+        )
+    try:
+        claims = repository.load_claims()
+        scanned = 0
+        with_assignment = 0
+        flagged = 0
+        if force:
+            ASSIGNMENT_MEASUREMENT_CACHE.clear()
+        for claim in claims:
+            scanned += 1
+            pdf_path = find_assignment_pdf(claim)
+            if pdf_path:
+                with_assignment += 1
+            needs_measurement, _ = claim_needs_measurement_photos(claim)
+            if needs_measurement:
+                flagged += 1
+        with MEASUREMENT_SCAN_LOCK:
+            MEASUREMENT_SCAN_STATUS.update(
+                {
+                    "running": False,
+                    "completed_at": datetime.now().isoformat(timespec="seconds"),
+                    "claims_scanned": scanned,
+                    "claims_with_assignment": with_assignment,
+                    "claims_flagged": flagged,
+                }
+            )
+    except Exception as exc:
+        with MEASUREMENT_SCAN_LOCK:
+            MEASUREMENT_SCAN_STATUS.update(
+                {
+                    "running": False,
+                    "completed_at": datetime.now().isoformat(timespec="seconds"),
+                    "last_error": str(exc),
+                }
+            )
+
+
+def start_measurement_scan(repository: ClaimsRepository, force: bool = False) -> bool:
+    with MEASUREMENT_SCAN_LOCK:
+        if MEASUREMENT_SCAN_STATUS.get("running"):
+            return False
+    worker = threading.Thread(
+        target=_run_measurement_scan,
+        args=(repository, force),
+        daemon=True,
+        name="measurement-scan",
+    )
+    worker.start()
+    return True
+
+
 def route_display_address(claim) -> str:
     for candidate in (
         getattr(claim, "route_address_override", ""),
@@ -228,6 +308,9 @@ class MobileApiHandler(BaseHTTPRequestHandler):
         if path == "/api/mobile/route-planner":
             self._serve_route_planner(parsed.query)
             return
+        if path == "/api/mobile/measurement-scan":
+            self._serve_measurement_scan(parsed.query)
+            return
         if path == "/api/mobile/route-plan":
             self._save_route_plan_from_query(parsed.query)
             return
@@ -281,6 +364,7 @@ class MobileApiHandler(BaseHTTPRequestHandler):
                     "claim_tools_folder": clean_text(settings.get("claim_tools_folder")),
                     "watched_folders": [clean_text(path) for path in settings.get("watched_folders", [])],
                 },
+                "measurement_scan": measurement_scan_snapshot(),
                 "tabs": [
                     "Claims",
                     "Route Planner",
@@ -456,8 +540,19 @@ class MobileApiHandler(BaseHTTPRequestHandler):
                 "start_from": clean_text(settings.get("route_home_address")),
                 "records": [self._route_record(claim) for claim in claims],
                 "planned_records": [],
+                "measurement_scan": measurement_scan_snapshot(),
             }
         )
+
+    def _serve_measurement_scan(self, query: str) -> None:
+        params = parse_qs(query)
+        force = clean_text(params.get("force", ["0"])[0]).lower() in {"1", "true", "yes"}
+        started = False
+        if force:
+            started = start_measurement_scan(self.repository, force=True)
+        payload = measurement_scan_snapshot()
+        payload["started"] = started
+        self._send_json(payload)
 
     def _save_route_plan(self) -> None:
         payload = self._read_json_body()
@@ -765,6 +860,7 @@ class MobileApiHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    start_measurement_scan(MobileApiHandler.repository, force=False)
     server = ThreadingHTTPServer((HOST, PORT), MobileApiHandler)
     print(f"Claims mobile API running at http://127.0.0.1:{PORT}")
     server.serve_forever()
