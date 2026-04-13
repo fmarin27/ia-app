@@ -1,0 +1,7 @@
+tunnel: 7597ce96-b9d3-4355-a081-2d95526f0698
+credentials-file: C:\Users\ferna\.cloudflared\7597ce96-b9d3-4355-a081-2d95526f0698.json
+
+ingress:
+  - hostname: api.luxuryimportsusa.shop
+    service: http://127.0.0.1:8011
+  - service: http_status:404

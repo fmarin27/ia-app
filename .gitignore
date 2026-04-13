@@ -5,3 +5,24 @@ Backups/
 __pycache__/
 *.pyc
 sftp_keys/
+*.log
+*.out.log
+*.err.log
+.expo/
+dist/
+node_modules/
+Office Updates/
+Payroll/
+mobile_app/.expo/
+mobile_app/dist/
+mobile_app/node_modules/
+mobile_app/*.log
+mobile_api/__pycache__/
+mobile_api/*.log
+claim_manager_3/__pycache__/
+claim_ocr_8rtl49cx/
+bridge_vendor/
+qt_vendor/
+CLAIMFLOW/
+FOXUSER.DBF
+FOXUSER.FPT

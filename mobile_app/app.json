@@ -1,0 +1,47 @@
+{
+  "expo": {
+    "name": "Claim Manager Mobile",
+    "slug": "claim-manager-mobile",
+    "version": "1.0.4",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "checkAutomatically": "ON_LOAD",
+      "fallbackToCacheTimeout": 0,
+      "url": "https://u.expo.dev/ff2bd9e5-fdc7-4dfc-b4b5-edba1573a46b"
+    },
+    "splash": {
+      "backgroundColor": "#11233b"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ]
+    ],
+    "android": {
+      "versionCode": 6,
+      "package": "com.fmarin.claimmanagermobile"
+    },
+    "ios": {
+      "buildNumber": "6",
+      "bundleIdentifier": "com.fmarin.claimmanagermobile"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "ff2bd9e5-fdc7-4dfc-b4b5-edba1573a46b"
+      }
+    },
+    "owner": "fmarin27"
+  }
+}

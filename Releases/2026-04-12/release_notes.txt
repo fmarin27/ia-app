@@ -1,0 +1,18 @@
+IA APP release package created on 2026-04-12.
+
+Desktop app:
+- Payroll PDF export cleaned up to print one page wide in landscape.
+- Payroll export now continues to extra pages only when row count requires it.
+- Payroll total stays boxed inside the table.
+- Office Update table emphasizes Progress and Additional Notes at the end.
+- Office Update paperwork field removed; paperwork is inferred from Progress text.
+- Open Claims table now includes Progress.
+- Assignment sheet opening prefers real assignment PDFs over bad saved paths.
+
+Mobile app:
+- Office Update removed from the mobile workflow.
+- Route Planner simplified to selected bucket workflow with address editing and reordering.
+- Navigation buttons support Google Maps, Waze, and Apple Maps.
+- Claims can show a MEASUREMENT PHOTOS REQUIRED flag when assignment instructions mention measured photos.
+
+Files included in this package are the updated source files needed to sync desktop and mobile code.

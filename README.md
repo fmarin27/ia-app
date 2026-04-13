@@ -1,6 +1,19 @@
-# Claims Manager
+# IA APP
 
-Local desktop app for tracking claim folders, open claims, and closed claims.
+Current project layout for the home PC, office PC, and mobile companion app.
+
+## Live Apps
+
+- Desktop app:
+  - Home launcher: `C:\Users\ferna\Desktop\IA APP\claim_manager_3\Start Claim Manager.bat`
+  - Office launcher: `C:\Users\ferna\Desktop\IA APP\claim_manager_3\Start Office Claim Manager.bat`
+  - Shared desktop code: `C:\Users\ferna\Desktop\IA APP\claim_manager_3`
+- Mobile API:
+  - `C:\Users\ferna\Desktop\IA APP\mobile_api\server.py`
+- Expo mobile app:
+  - `C:\Users\ferna\Desktop\IA APP\mobile_app`
+
+`claims_manager.py` is now legacy and is no longer the active desktop app.
 
 ## SFTP Transfer Tool
 
@@ -76,31 +89,7 @@ Typical setup:
 
 The bridge is intentionally approval-gated for command execution. A command request can be broad, but the receiving PC still asks you before it runs.
 
-## What it does
+## Shared Data
 
-- Watches one or more folders you choose.
-- Treats each file or subfolder inside those watched folders as a claim entry.
-- Shows tabs for all claims, open claims, and closed claims.
-- Lets you add manual claims that are not tied to a folder yet.
-- Saves notes, status, and assignment details in `claims_data.json`.
-
-## Run it
-
-```powershell
-python claims_manager.py
-```
-
-## How to use it
-
-1. Click `Add Folder` and choose a folder that contains your claim folders or files.
-2. Click a claim to review it on the right.
-3. Add notes and save them.
-4. Use `Mark Open` or `Mark Closed` to manage status.
-5. Click `Refresh Scan` anytime after folder contents change.
-
-## Stored data
-
-- App file: `claims_manager.py`
-- Local data: `claims_data.json`
-
-The JSON file is created automatically the first time you use the app.
+- Local claim data: `C:\Users\ferna\Desktop\IA APP\claims_data.json`
+- The office launcher uses the same PySide6 app with office-specific sync behavior in `claim_manager_3\data_access.py`.

@@ -1,4 +1,6 @@
-﻿import json
+import json
+import base64
+import struct
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta
 from email.message import EmailMessage
@@ -13,6 +15,7 @@ import smtplib
 import subprocess
 import sys
 import threading
+import typing
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from copy import copy
@@ -41,12 +44,17 @@ VENDOR_DIR = APP_DIR / "vendor"
 WORKING_SHEETS_DIR = APP_DIR / "Working Sheets"
 MITCHELL_TOTAL_LOSS_TEMPLATE = Path(DEFAULT_TOOLS_FOLDER) / "MITCHELL TOTAL LOSS.doc"
 OFFICE_UPDATE_EMAIL_FROM = "fernandomarin27@gmail.com"
-OFFICE_UPDATE_EMAIL_TO = "gferreira@duhamels.com"
-OFFICE_UPDATE_EMAIL_CC = "joe@lasalallc.com"
+OFFICE_UPDATE_EMAIL_TO = "ldellacorte@duhamels.com"
+OFFICE_UPDATE_EMAIL_CC = "joe@lasalallc.com, dnoone@duhamels.com"
 OFFICE_UPDATE_EMAIL_SUBJECT = "Open sheet"
 OFFICE_UPDATE_EMAIL_BODY = "thank you!"
+OFFICE_RMC_EMAIL_TO = "gferreira@duhamels.com"
 ROUTE_HOME_ADDRESS = "5 Richlee Rd, Norwalk, CT 06851"
+APP_DISPLAY_NAME = "Claim Manager 2.0"
+APP_OWNER_NAME = "Fernando Marin"
 APPTRAK_DOCS_DIR = Path(r"C:\AMobile\docs")
+APPTRAK_DBF_DIR = Path(r"C:\AMobile\dbf")
+APPTRAK_PICS_DIR = Path(r"C:\AMobile\pics")
 APPTRAK_AUTOMATION_DIR = Path(r"C:\AMobile\automation")
 APPTRAK_IMPORT_BAT = APPTRAK_AUTOMATION_DIR / "Run-AppTrakImport.bat"
 APPTRAK_EXE = Path(r"C:\AMobile\app\apptrak.exe")
@@ -235,6 +243,8 @@ class ClaimRecord:
     facts_of_loss: str = ""
     total_loss: bool = False
     shop_name: str = ""
+    shop_phone: str = ""
+    shop_email: str = ""
     contact_phone: str = ""
     contact_email: str = ""
     assign_pdf_path: str = ""
@@ -260,11 +270,15 @@ class ClaimsStore:
             "watched_folders": DEFAULT_WATCHED_FOLDERS.copy(),
             "claim_tools_folder": DEFAULT_TOOLS_FOLDER,
             "claim_tools_contacts": [],
+            "claim_tools_files": [],
+            "body_shop_database": [],
+            "claim_saved_state": {},
             "processed_apptrak_pdfs": [],
             "email_settings": {
                 "office_update_from": OFFICE_UPDATE_EMAIL_FROM,
                 "office_update_app_password": "",
             },
+            "office_updates": {},
             "route_plan_keys": [],
             "route_geocode_cache": {},
             "claims": {},
@@ -280,8 +294,12 @@ class ClaimsStore:
         loaded.setdefault("watched_folders", default_data["watched_folders"])
         loaded.setdefault("claim_tools_folder", default_data["claim_tools_folder"])
         loaded.setdefault("claim_tools_contacts", default_data["claim_tools_contacts"])
+        loaded.setdefault("claim_tools_files", default_data["claim_tools_files"])
+        loaded.setdefault("body_shop_database", default_data["body_shop_database"])
+        loaded.setdefault("claim_saved_state", default_data["claim_saved_state"])
         loaded.setdefault("processed_apptrak_pdfs", default_data["processed_apptrak_pdfs"])
         loaded.setdefault("email_settings", default_data["email_settings"])
+        loaded.setdefault("office_updates", default_data["office_updates"])
         loaded.setdefault("route_plan_keys", default_data["route_plan_keys"])
         loaded.setdefault("route_geocode_cache", default_data["route_geocode_cache"])
         loaded.setdefault("claims", {})
@@ -355,6 +373,22 @@ class ClaimsStore:
         return self.data.setdefault("claim_tools_contacts", [])
 
     @property
+    def claim_tools_files(self) -> list[dict[str, str]]:
+        return self.data.setdefault("claim_tools_files", [])
+
+    @property
+    def body_shop_database(self) -> list[dict[str, str]]:
+        return self.data.setdefault("body_shop_database", [])
+
+    @property
+    def claim_saved_state(self) -> dict:
+        return self.data.setdefault("claim_saved_state", {})
+
+    @property
+    def office_updates(self) -> dict:
+        return self.data.setdefault("office_updates", {})
+
+    @property
     def processed_apptrak_pdfs(self) -> list[str]:
         return self.data.setdefault("processed_apptrak_pdfs", [])
 
@@ -402,13 +436,91 @@ class ClaimsStore:
         item = self.claims.get(key)
         if not item:
             return None
-        return ClaimRecord(**self._normalize_claim_item(item))
+        normalized = self._normalize_claim_item(item)
+        saved_state = self.get_saved_claim_state(
+            claim_key=key,
+            claim_id=normalized.get("claim_id", ""),
+            source_path=normalized.get("source_path", ""),
+        )
+        if saved_state:
+            self.apply_saved_claim_state(normalized, saved_state)
+        office_update = self.office_updates.get(key, {}) or {}
+        if isinstance(office_update, dict):
+            for field_name in ("office_appt_when", "office_progress_status", "office_waiting_for_paperwork", "office_additional_notes"):
+                if field_name in office_update:
+                    normalized[field_name] = office_update.get(field_name, normalized.get(field_name, ""))
+        return ClaimRecord(**normalized)
+
+    def _claim_state_aliases(self, claim_key: str = "", claim_id: str = "", source_path: str = "") -> list[str]:
+        aliases: list[str] = []
+        if claim_key:
+            aliases.append(claim_key)
+        cleaned_path = (source_path or "").strip()
+        if cleaned_path:
+            aliases.append(f"path::{cleaned_path.lower()}")
+        cleaned_id = extract_job_number_from_text(str(claim_id or ""))
+        if cleaned_id:
+            aliases.append(f"id::{cleaned_id}")
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for alias in aliases:
+            if alias and alias not in seen:
+                seen.add(alias)
+                ordered.append(alias)
+        return ordered
+
+    def get_saved_claim_state(self, claim_key: str = "", claim_id: str = "", source_path: str = "") -> dict:
+        for alias in self._claim_state_aliases(claim_key, claim_id, source_path):
+            value = self.claim_saved_state.get(alias)
+            if isinstance(value, dict) and value:
+                return dict(value)
+        return {}
+
+    def save_claim_state(self, record: ClaimRecord) -> None:
+        payload = {
+            "notes": record.notes,
+            "note_history": list(record.note_history or []),
+            "route_address_override": record.route_address_override,
+            "manual_overrides": dict(record.manual_overrides or {}),
+            "office_appt_when": record.office_appt_when,
+            "office_progress_status": record.office_progress_status,
+            "office_waiting_for_paperwork": record.office_waiting_for_paperwork,
+            "office_additional_notes": record.office_additional_notes,
+        }
+        for alias in self._claim_state_aliases(record.key, record.claim_id, record.source_path):
+            self.claim_saved_state[alias] = dict(payload)
+
+    def apply_saved_claim_state(self, target: dict, saved_state: dict) -> None:
+        if not isinstance(saved_state, dict):
+            return
+        note_history = saved_state.get("note_history")
+        if isinstance(note_history, list):
+            target["note_history"] = note_history
+            target["notes"] = saved_state.get("notes", render_note_history(note_history))
+        elif "notes" in saved_state:
+            target["notes"] = saved_state.get("notes", target.get("notes", ""))
+        if "route_address_override" in saved_state:
+            target["route_address_override"] = saved_state.get("route_address_override", target.get("route_address_override", ""))
+        manual_overrides = saved_state.get("manual_overrides")
+        if isinstance(manual_overrides, dict):
+            merged = dict(target.get("manual_overrides", {}) or {})
+            merged.update(manual_overrides)
+            target["manual_overrides"] = merged
+            for field_name, value in manual_overrides.items():
+                target[field_name] = value
+        for field_name in ("office_appt_when", "office_progress_status", "office_waiting_for_paperwork", "office_additional_notes"):
+            if field_name in saved_state:
+                target[field_name] = saved_state.get(field_name, target.get(field_name, ""))
 
     def normalize_all_claims(self) -> None:
         self.data["claims"] = {
             key: self._normalize_claim_item(value)
             for key, value in self.claims.items()
         }
+        for key, value in self.data["claims"].items():
+            normalized = self._normalize_claim_item(value)
+            record = ClaimRecord(**normalized)
+            self.save_claim_state(record)
 
     def _normalize_claim_item(self, item: dict) -> dict:
         normalized = dict(item)
@@ -424,6 +536,8 @@ class ClaimsStore:
         normalized.setdefault("damage_description", "")
         normalized.setdefault("facts_of_loss", "")
         normalized.setdefault("total_loss", False)
+        normalized.setdefault("shop_phone", "")
+        normalized.setdefault("shop_email", "")
         normalized.setdefault("route_address_override", "")
         normalized.setdefault("office_contacted", "No")
         normalized.setdefault("office_appt_when", "")
@@ -438,8 +552,9 @@ class ClaimsStore:
 class ClaimsManagerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Claims Manager")
+        self.root.title(APP_DISPLAY_NAME)
         self.root.geometry("1280x760")
+        self.root.minsize(1080, 680)
         self.store = ClaimsStore(DATA_FILE)
         self.store.normalize_all_claims()
         self.store.save()
@@ -452,6 +567,8 @@ class ClaimsManagerApp:
         self.office_tree: ttk.Treeview | None = None
         self.office_notes_text: tk.Text | None = None
         self.claim_tools_contacts_tree: ttk.Treeview | None = None
+        self.claim_tools_files_tree: ttk.Treeview | None = None
+        self.body_shops_tree: ttk.Treeview | None = None
         self.route_available_tree: ttk.Treeview | None = None
         self.route_selected_tree: ttk.Treeview | None = None
         self.route_selected_stop_key: str | None = None
@@ -460,7 +577,8 @@ class ClaimsManagerApp:
         self.last_dialog_geometry: tuple[int, int, int, int] | None = None
         self.apptrak_import_running = False
         self.apptrak_after_id: str | None = None
-        self.apptrak_status_var = tk.StringVar(value="AppTrak import idle.")
+        self._mousewheel_target: typing.Callable[[int], None] | None = None
+        self.apptrak_status_var = tk.StringVar(value="AppTrak import ready. Manual check only.")
         self.summary_vars = {
             "all": tk.StringVar(value="0"),
             "open": tk.StringVar(value="0"),
@@ -482,6 +600,8 @@ class ClaimsManagerApp:
         self.office_waiting_for_paperwork_var = tk.StringVar(value="No")
         self.route_home_var = tk.StringVar(value=ROUTE_HOME_ADDRESS)
         self.route_address_var = tk.StringVar()
+        self.route_claim_status_filter_var = tk.StringVar(value="Open")
+        self.route_appt_only_var = tk.BooleanVar(value=True)
         self.route_status_var = tk.StringVar(value="Build tomorrow's route from your house.")
         self.editable_detail_keys = {
             "claim_id",
@@ -498,6 +618,8 @@ class ClaimsManagerApp:
             "facts_of_loss",
             "total_loss",
             "shop_name",
+            "shop_phone",
+            "shop_email",
             "contact_phone",
             "contact_email",
             "assignment_claim_notes",
@@ -525,15 +647,25 @@ class ClaimsManagerApp:
             "facts_of_loss": tk.StringVar(),
             "total_loss": tk.StringVar(),
             "shop_name": tk.StringVar(),
+            "shop_phone": tk.StringVar(),
+            "shop_email": tk.StringVar(),
             "contact_phone": tk.StringVar(),
             "contact_email": tk.StringVar(),
+            "shop_contact_name": tk.StringVar(),
+            "shop_body_rate": tk.StringVar(),
+            "shop_paint_rate": tk.StringVar(),
+            "shop_frame_rate": tk.StringVar(),
+            "shop_mechanical_rate": tk.StringVar(),
+            "shop_certifications": tk.StringVar(),
+            "shop_negotiation_notes": tk.StringVar(),
             "assign_pdf_path": tk.StringVar(),
             "assignment_claim_notes": tk.StringVar(),
         }
 
+        self._configure_styles()
         self._build_ui()
+        self._bind_global_mousewheel()
         self.scan_folders()
-        self._schedule_next_apptrak_check(initial_delay_ms=15000)
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=3)
@@ -562,10 +694,13 @@ class ClaimsManagerApp:
         ttk.Button(controls, text="New Claim", command=self.add_manual_claim).grid(row=0, column=5)
         ttk.Label(header, textvariable=self.apptrak_status_var).grid(row=1, column=1, sticky="e", pady=(8, 0))
 
-        summary = ttk.Frame(self.root, padding=(16, 0, 16, 16))
-        summary.grid(row=1, column=0, sticky="nsew")
+        content_pane = ttk.Panedwindow(self.root, orient="horizontal")
+        content_pane.grid(row=1, column=0, columnspan=2, sticky="nsew")
+
+        summary = ttk.Frame(content_pane, padding=(16, 0, 8, 16))
         summary.columnconfigure((0, 1, 2), weight=1)
         summary.rowconfigure(1, weight=1)
+        content_pane.add(summary, weight=5)
 
         self._summary_card(summary, "All Claims", self.summary_vars["all"], 0)
         self._summary_card(summary, "Open Claims", self.summary_vars["open"], 1)
@@ -585,6 +720,10 @@ class ClaimsManagerApp:
         self.tree_context_menu = tk.Menu(self.root, tearoff=0)
         self.tree_context_menu.add_command(label="Open Working Sheet", command=self.open_working_sheet_for_selected_claim)
         self.tree_context_menu.add_command(label="Email Assignment Sheet", command=self.email_assignment_sheet_for_selected_claim)
+        self.tree_context_menu.add_command(label="Review Email", command=self.send_review_email_for_selected_claim)
+        self.tree_context_menu.add_command(label="RMC", command=self.send_rmc_email_for_selected_claim)
+        self.tree_context_menu.add_command(label="Send Prelim", command=self.send_prelim_email_for_selected_claim)
+        self.tree_context_menu.add_command(label="Email Copy To Shop", command=self.open_shop_email_draft_for_selected_claim)
         self.tree_context_menu.add_command(label="NADA Value PDF", command=self.generate_nada_pdf_for_selected_claim)
         self.claim_tools_menu = tk.Menu(self.tree_context_menu, tearoff=0)
         self.tree_context_menu.add_cascade(label="Claim Tools", menu=self.claim_tools_menu)
@@ -674,19 +813,20 @@ class ClaimsManagerApp:
         office_list_frame.rowconfigure(0, weight=1)
         self.office_tree = ttk.Treeview(
             office_list_frame,
-            columns=("claim_id", "customer", "status", "inspection_when"),
+            columns=("claim_id", "customer", "shop", "status", "inspection_when"),
             show="headings",
             selectmode="browse",
         )
         for col, width in [
             ("claim_id", 90),
-            ("customer", 260),
-            ("status", 260),
+            ("customer", 220),
+            ("shop", 190),
+            ("status", 220),
             ("inspection_when", 140),
         ]:
             self.office_tree.heading(col, text=col.replace("_", " ").title())
             self.office_tree.column(col, width=width, anchor="w")
-        self._configure_tree_sorting(self.office_tree, ("claim_id", "customer", "status", "inspection_when"))
+        self._configure_tree_sorting(self.office_tree, ("claim_id", "customer", "shop", "status", "inspection_when"))
         self.office_tree.grid(row=0, column=0, sticky="nsew")
         office_scroll = ttk.Scrollbar(office_list_frame, orient="vertical", command=self.office_tree.yview)
         office_scroll.grid(row=0, column=1, sticky="ns")
@@ -701,10 +841,13 @@ class ClaimsManagerApp:
         office_bottom_frame.rowconfigure(0, weight=0)
         office_bottom_frame.rowconfigure(1, weight=1)
 
-        office_form_frame = ttk.LabelFrame(office_bottom_frame, text="Update Details", padding=12)
+        office_form_frame = ttk.LabelFrame(office_bottom_frame, text="Update Details", padding=(12, 8))
         office_form_frame.grid(row=0, column=0, sticky="new", padx=(0, 8))
         office_form_frame.columnconfigure(1, weight=1)
-        ttk.Label(office_form_frame, text="Progress").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
+        ttk.Button(office_form_frame, text="Save Update", command=self.save_office_update).grid(
+            row=0, column=1, sticky="e", pady=(0, 2)
+        )
+        ttk.Label(office_form_frame, text="Progress").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=4)
         ttk.Combobox(
             office_form_frame,
             textvariable=self.office_progress_status_var,
@@ -718,15 +861,14 @@ class ClaimsManagerApp:
                 "Waiting For Paperwork",
             ],
             state="readonly",
-        ).grid(row=0, column=1, sticky="ew", pady=4)
-        ttk.Label(office_form_frame, text="Date Of Inspection Set Up").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=4)
-        ttk.Entry(office_form_frame, textvariable=self.office_appt_when_var).grid(row=1, column=1, sticky="ew", pady=4)
-        ttk.Label(office_form_frame, text="Waiting For Paperwork?").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=4)
-        ttk.Combobox(office_form_frame, textvariable=self.office_waiting_for_paperwork_var, values=["Yes", "No"], state="readonly").grid(row=2, column=1, sticky="ew", pady=4)
-        ttk.Label(office_form_frame, text="Additional Notes").grid(row=3, column=0, sticky="nw", padx=(0, 10), pady=4)
-        self.office_notes_text = tk.Text(office_form_frame, height=4, wrap="word")
-        self.office_notes_text.grid(row=3, column=1, sticky="ew", pady=4)
-        ttk.Button(office_form_frame, text="Save Update", command=self.save_office_update).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ).grid(row=1, column=1, sticky="ew", pady=4)
+        ttk.Label(office_form_frame, text="Date Of Inspection Set Up").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=4)
+        ttk.Entry(office_form_frame, textvariable=self.office_appt_when_var).grid(row=2, column=1, sticky="ew", pady=4)
+        ttk.Label(office_form_frame, text="Waiting For Paperwork?").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=4)
+        ttk.Combobox(office_form_frame, textvariable=self.office_waiting_for_paperwork_var, values=["Yes", "No"], state="readonly").grid(row=3, column=1, sticky="ew", pady=4)
+        ttk.Label(office_form_frame, text="Additional Notes").grid(row=4, column=0, sticky="nw", padx=(0, 10), pady=4)
+        self.office_notes_text = tk.Text(office_form_frame, height=3, wrap="word")
+        self.office_notes_text.grid(row=4, column=1, sticky="ew", pady=4)
 
         office_summary_frame = ttk.LabelFrame(office_bottom_frame, text="Selected Claim Summary", padding=12)
         office_summary_frame.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=(8, 0))
@@ -750,7 +892,13 @@ class ClaimsManagerApp:
         tools_tab = ttk.Frame(notebook, padding=12)
         tools_tab.columnconfigure(0, weight=1)
         tools_tab.rowconfigure(0, weight=1)
+        tools_tab.rowconfigure(1, weight=1)
         notebook.add(tools_tab, text="Claim Tools")
+
+        body_shops_tab = ttk.Frame(notebook, padding=12)
+        body_shops_tab.columnconfigure(0, weight=1)
+        body_shops_tab.rowconfigure(0, weight=1)
+        notebook.add(body_shops_tab, text="Body Shops")
 
         tools_contacts_frame = ttk.LabelFrame(tools_tab, text="Names And Numbers", padding=12)
         tools_contacts_frame.grid(row=0, column=0, sticky="nsew")
@@ -785,14 +933,107 @@ class ClaimsManagerApp:
         ttk.Button(tools_contacts_actions, text="Edit", command=self.edit_claim_tool_contact).grid(row=0, column=1, sticky="ew", padx=6)
         ttk.Button(tools_contacts_actions, text="Remove", command=self.remove_claim_tool_contact).grid(row=0, column=2, sticky="ew", padx=(6, 0))
 
+        tools_files_frame = ttk.LabelFrame(tools_tab, text="File Sections", padding=12)
+        tools_files_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        tools_files_frame.columnconfigure(0, weight=1)
+        tools_files_frame.rowconfigure(0, weight=1)
+
+        self.claim_tools_files_tree = ttk.Treeview(
+            tools_files_frame,
+            columns=("section", "label", "file_name", "notes"),
+            show="headings",
+            selectmode="browse",
+        )
+        self.claim_tools_files_tree.heading("section", text="Section")
+        self.claim_tools_files_tree.heading("label", text="Label")
+        self.claim_tools_files_tree.heading("file_name", text="File")
+        self.claim_tools_files_tree.heading("notes", text="Notes")
+        self.claim_tools_files_tree.column("section", width=180, anchor="w")
+        self.claim_tools_files_tree.column("label", width=220, anchor="w")
+        self.claim_tools_files_tree.column("file_name", width=260, anchor="w")
+        self.claim_tools_files_tree.column("notes", width=320, anchor="w")
+        self._configure_tree_sorting(self.claim_tools_files_tree, ("section", "label", "file_name", "notes"))
+        self.claim_tools_files_tree.grid(row=0, column=0, sticky="nsew")
+        tools_files_scroll = ttk.Scrollbar(tools_files_frame, orient="vertical", command=self.claim_tools_files_tree.yview)
+        tools_files_scroll.grid(row=0, column=1, sticky="ns")
+        self.claim_tools_files_tree.configure(yscrollcommand=tools_files_scroll.set)
+        self.claim_tools_files_tree.bind("<Double-1>", self.open_claim_tool_file_entry)
+
+        tools_files_actions = ttk.Frame(tools_files_frame)
+        tools_files_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        tools_files_actions.columnconfigure((0, 1, 2, 3), weight=1)
+        ttk.Button(tools_files_actions, text="Add", command=self.add_claim_tool_file).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(tools_files_actions, text="Edit", command=self.edit_claim_tool_file).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(tools_files_actions, text="Open", command=self.open_claim_tool_file_entry).grid(row=0, column=2, sticky="ew", padx=6)
+        ttk.Button(tools_files_actions, text="Remove", command=self.remove_claim_tool_file).grid(row=0, column=3, sticky="ew", padx=(6, 0))
+
+        body_shops_frame = ttk.LabelFrame(body_shops_tab, text="Body Shop Database", padding=12)
+        body_shops_frame.grid(row=0, column=0, sticky="nsew")
+        body_shops_frame.columnconfigure(0, weight=1)
+        body_shops_frame.rowconfigure(0, weight=1)
+
+        self.body_shops_tree = ttk.Treeview(
+            body_shops_frame,
+            columns=("shop_name", "contact_name", "phone", "email", "body_rate", "paint_rate", "certifications"),
+            show="headings",
+            selectmode="browse",
+        )
+        self.body_shops_tree.heading("shop_name", text="Shop")
+        self.body_shops_tree.heading("contact_name", text="Contact")
+        self.body_shops_tree.heading("phone", text="Phone")
+        self.body_shops_tree.heading("email", text="Email")
+        self.body_shops_tree.heading("body_rate", text="Body Rate")
+        self.body_shops_tree.heading("paint_rate", text="Paint Rate")
+        self.body_shops_tree.heading("certifications", text="Certifications")
+        self.body_shops_tree.column("shop_name", width=220, anchor="w")
+        self.body_shops_tree.column("contact_name", width=160, anchor="w")
+        self.body_shops_tree.column("phone", width=130, anchor="w")
+        self.body_shops_tree.column("email", width=220, anchor="w")
+        self.body_shops_tree.column("body_rate", width=90, anchor="w")
+        self.body_shops_tree.column("paint_rate", width=90, anchor="w")
+        self.body_shops_tree.column("certifications", width=240, anchor="w")
+        self._configure_tree_sorting(
+            self.body_shops_tree,
+            ("shop_name", "contact_name", "phone", "email", "body_rate", "paint_rate", "certifications"),
+        )
+        self.body_shops_tree.grid(row=0, column=0, sticky="nsew")
+        body_shops_scroll = ttk.Scrollbar(body_shops_frame, orient="vertical", command=self.body_shops_tree.yview)
+        body_shops_scroll.grid(row=0, column=1, sticky="ns")
+        self.body_shops_tree.configure(yscrollcommand=body_shops_scroll.set)
+        self.body_shops_tree.bind("<Double-1>", self.call_body_shop_phone)
+
+        body_shops_actions = ttk.Frame(body_shops_frame)
+        body_shops_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        body_shops_actions.columnconfigure((0, 1, 2), weight=1)
+        ttk.Button(body_shops_actions, text="Add", command=self.add_body_shop_entry).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(body_shops_actions, text="Edit", command=self.edit_body_shop_entry).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(body_shops_actions, text="Remove", command=self.remove_body_shop_entry).grid(row=0, column=2, sticky="ew", padx=(6, 0))
+
         route_top = ttk.LabelFrame(route_frame, text="Route Settings", padding=12)
         route_top.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
         route_top.columnconfigure(1, weight=1)
+        route_top.columnconfigure(3, weight=1)
         ttk.Label(route_top, text="Start From").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Entry(route_top, textvariable=self.route_home_var).grid(row=0, column=1, sticky="ew")
-        ttk.Label(route_top, textvariable=self.route_status_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(route_top, text="Show").grid(row=0, column=2, sticky="w", padx=(12, 8))
+        route_status_filter = ttk.Combobox(
+            route_top,
+            textvariable=self.route_claim_status_filter_var,
+            values=("Open", "Closed", "All"),
+            state="readonly",
+            width=12,
+        )
+        route_status_filter.grid(row=0, column=3, sticky="w")
+        route_status_filter.bind("<<ComboboxSelected>>", lambda _event: self.refresh_views())
+        ttk.Checkbutton(
+            route_top,
+            text="Appointment Scheduled Only",
+            variable=self.route_appt_only_var,
+            command=self.refresh_views,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(route_top, textvariable=self.route_status_var).grid(row=1, column=2, columnspan=2, sticky="w", pady=(8, 0))
 
-        route_available_frame = ttk.LabelFrame(route_frame, text="Open Claims", padding=12)
+        route_available_frame = ttk.LabelFrame(route_frame, text="Available Claims", padding=12)
         route_available_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
         route_available_frame.columnconfigure(0, weight=1)
         route_available_frame.rowconfigure(0, weight=1)
@@ -847,11 +1088,10 @@ class ClaimsManagerApp:
         ttk.Button(route_actions, text="Email Uninspected Only", command=self.email_uninspected_only_to_self).grid(row=0, column=1, sticky="ew", padx=6)
         ttk.Button(route_actions, text="Clear Route", command=self.clear_route_plan).grid(row=0, column=2, sticky="ew", padx=(6, 0))
 
-        side = ttk.Frame(self.root, padding=(0, 0, 16, 16))
-        side.grid(row=1, column=1, sticky="nsew")
+        side = ttk.Frame(content_pane, padding=(8, 0, 16, 16))
         side.columnconfigure(0, weight=1)
         side.rowconfigure(1, weight=1)
-        side.rowconfigure(2, weight=1)
+        content_pane.add(side, weight=3)
 
         top_info = ttk.Frame(side)
         top_info.grid(row=0, column=0, sticky="ew", pady=(0, 12))
@@ -870,10 +1110,13 @@ class ClaimsManagerApp:
         tools.columnconfigure(0, weight=1)
         ttk.Label(tools, textvariable=self.tools_folder_var, wraplength=360, justify="left").grid(row=0, column=0, sticky="w")
 
+        side_pane = ttk.Panedwindow(side, orient="vertical")
+        side_pane.grid(row=1, column=0, sticky="nsew")
+
         details_wrap = ttk.LabelFrame(side, text="Claim Details", padding=8)
-        details_wrap.grid(row=1, column=0, sticky="nsew", pady=(0, 12))
         details_wrap.columnconfigure(0, weight=1)
         details_wrap.rowconfigure(0, weight=1)
+        side_pane.add(details_wrap, weight=3)
 
         details_canvas = tk.Canvas(details_wrap, highlightthickness=0)
         details_canvas.grid(row=0, column=0, sticky="nsew")
@@ -909,15 +1152,36 @@ class ClaimsManagerApp:
             ("Facts of Loss", "facts_of_loss"),
             ("Total Loss", "total_loss"),
             ("Shop", "shop_name"),
+            ("Shop Contact", "shop_contact_name"),
+            ("Shop Phone", "shop_phone"),
+            ("Shop Email", "shop_email"),
+            ("Shop Body Rate", "shop_body_rate"),
+            ("Shop Paint Rate", "shop_paint_rate"),
+            ("Shop Frame Rate", "shop_frame_rate"),
+            ("Shop Mechanical Rate", "shop_mechanical_rate"),
+            ("Shop Certifications", "shop_certifications"),
+            ("Shop Negotiation Notes", "shop_negotiation_notes"),
             ("Contact Phone", "contact_phone"),
             ("Contact Email", "contact_email"),
             ("Claim Notes", "assignment_claim_notes"),
             ("Status", "status"),
             ("Updated", "updated_at"),
         ]
+        readonly_detail_keys = {
+            "status",
+            "updated_at",
+            "shop_contact_name",
+            "shop_body_rate",
+            "shop_paint_rate",
+            "shop_frame_rate",
+            "shop_mechanical_rate",
+            "shop_certifications",
+            "shop_negotiation_notes",
+        }
         for idx, (label, key) in enumerate(detail_rows):
             ttk.Label(details, text=label).grid(row=idx, column=0, sticky="nw", padx=(0, 10), pady=3)
-            value_entry = ttk.Entry(details, textvariable=self.detail_vars[key], state="normal")
+            entry_state = "readonly" if key in readonly_detail_keys else "normal"
+            value_entry = ttk.Entry(details, textvariable=self.detail_vars[key], state=entry_state)
             value_entry.grid(row=idx, column=1, sticky="ew", pady=3)
 
         ttk.Label(details, text="Folder").grid(row=len(detail_rows), column=0, sticky="nw", padx=(0, 10), pady=(8, 3))
@@ -932,10 +1196,10 @@ class ClaimsManagerApp:
         )
 
         notes_frame = ttk.LabelFrame(side, text="Notes", padding=8)
-        notes_frame.grid(row=2, column=0, sticky="nsew")
         notes_frame.columnconfigure(0, weight=1)
         notes_frame.rowconfigure(1, weight=1)
         notes_frame.rowconfigure(3, weight=1)
+        side_pane.add(notes_frame, weight=2)
 
         ttk.Label(notes_frame, text="New Note").grid(row=0, column=0, sticky="w")
         self.new_note_text = tk.Text(notes_frame, height=4, wrap="word")
@@ -953,10 +1217,110 @@ class ClaimsManagerApp:
         ttk.Button(actions, text="Reopen As Supp", command=self.reopen_selected_claim_as_supplement).grid(row=0, column=2, sticky="ew", padx=(0, 8))
         ttk.Button(actions, text="Mark Closed", command=lambda: self.set_selected_status("Closed")).grid(row=0, column=3, sticky="ew")
 
+        self._style_plain_widget(self.folder_list)
+        self._style_plain_widget(details_canvas)
+        self._style_plain_widget(self.office_notes_text)
+        self._style_plain_widget(self.office_summary_text)
+        self._style_plain_widget(self.new_note_text)
+        self._style_plain_widget(self.notes_history_text)
+        self._bind_scroll_target(self.folder_list, lambda delta: self.folder_list.yview_scroll(delta, "units"))
+        self._bind_scroll_target(details_canvas, lambda delta: details_canvas.yview_scroll(delta, "units"))
+        self._bind_scroll_target(self.office_tree, lambda delta: self.office_tree.yview_scroll(delta, "units"))
+        self._bind_scroll_target(self.reports_tree, lambda delta: self.reports_tree.yview_scroll(delta, "units"))
+        self._bind_scroll_target(self.claim_tools_contacts_tree, lambda delta: self.claim_tools_contacts_tree.yview_scroll(delta, "units"))
+        self._bind_scroll_target(self.claim_tools_files_tree, lambda delta: self.claim_tools_files_tree.yview_scroll(delta, "units"))
+        self._bind_scroll_target(self.body_shops_tree, lambda delta: self.body_shops_tree.yview_scroll(delta, "units"))
+        self._bind_scroll_target(self.route_available_tree, lambda delta: self.route_available_tree.yview_scroll(delta, "units"))
+        self._bind_scroll_target(self.route_selected_tree, lambda delta: self.route_selected_tree.yview_scroll(delta, "units"))
+        self._bind_scroll_target(self.office_notes_text, lambda delta: self.office_notes_text.yview_scroll(delta, "units"))
+        self._bind_scroll_target(self.office_summary_text, lambda delta: self.office_summary_text.yview_scroll(delta, "units"))
+        self._bind_scroll_target(self.new_note_text, lambda delta: self.new_note_text.yview_scroll(delta, "units"))
+        self._bind_scroll_target(self.notes_history_text, lambda delta: self.notes_history_text.yview_scroll(delta, "units"))
+
     def _summary_card(self, parent: ttk.Frame, label: str, value_var: tk.StringVar, column: int) -> None:
         card = ttk.LabelFrame(parent, text=label, padding=16)
         card.grid(row=0, column=column, sticky="ew", padx=(0, 10) if column < 2 else 0)
         ttk.Label(card, textvariable=value_var, font=("Segoe UI", 18, "bold")).grid(row=0, column=0, sticky="w")
+
+    def _configure_styles(self) -> None:
+        style = ttk.Style()
+        style.theme_use("clam")
+        self.root.configure(bg="#f6f8fb")
+
+        style.configure(".", background="#f2f5f9", foreground="#223042", font=("Segoe UI", 10))
+        style.configure("TFrame", background="#f2f5f9")
+        style.configure("TLabel", background="#f2f5f9", foreground="#223042")
+        style.configure("TLabelframe", background="#f8fafd", borderwidth=1, relief="solid")
+        style.configure("TLabelframe.Label", background="#f8fafd", foreground="#34465c", font=("Segoe UI", 10, "bold"))
+        style.configure("TButton", padding=(14, 9), relief="flat", borderwidth=0, background="#e3ebf5", foreground="#223042")
+        style.map("TButton", background=[("active", "#d7e3f1"), ("pressed", "#cddceb")])
+        style.configure("TEntry", fieldbackground="#ffffff", bordercolor="#cfd9e6", lightcolor="#cfd9e6", darkcolor="#cfd9e6", padding=8)
+        style.configure("TCombobox", fieldbackground="#ffffff", background="#ffffff", bordercolor="#cfd9e6", lightcolor="#cfd9e6", darkcolor="#cfd9e6", padding=6)
+        style.configure("Treeview", background="#ffffff", fieldbackground="#ffffff", foreground="#223042", rowheight=31, bordercolor="#dde5ef")
+        style.configure("Treeview.Heading", background="#eaf0f7", foreground="#4a5d74", relief="flat", padding=(8, 8))
+        style.map("Treeview", background=[("selected", "#cfe2f7")], foreground=[("selected", "#132030")])
+        style.map("Treeview.Heading", background=[("active", "#e1e9f3")])
+        style.configure("TNotebook", background="#f2f5f9", borderwidth=0, tabmargins=(0, 0, 0, 0))
+        style.configure("TNotebook.Tab", background="#e5ebf3", foreground="#4a5c72", padding=(16, 9), borderwidth=0)
+        style.map("TNotebook.Tab", background=[("selected", "#ffffff"), ("active", "#edf2f8")], foreground=[("selected", "#1c2a39")])
+        style.configure("TPanedwindow", background="#f2f5f9", sashwidth=8)
+        style.configure("Vertical.TScrollbar", background="#e3ebf5", troughcolor="#f7f9fc", arrowcolor="#65758a", bordercolor="#e3ebf5")
+        style.configure("Horizontal.TScrollbar", background="#e3ebf5", troughcolor="#f7f9fc", arrowcolor="#65758a", bordercolor="#e3ebf5")
+
+    def _style_plain_widget(self, widget: tk.Widget | None) -> None:
+        if widget is None:
+            return
+        try:
+            widget.configure(
+                bg="#ffffff",
+                fg="#223042",
+                insertbackground="#223042",
+                selectbackground="#cfe2f7",
+                selectforeground="#16202c",
+                relief="flat",
+                highlightthickness=1,
+                highlightbackground="#cfd9e6",
+                highlightcolor="#b7d0ee",
+                bd=0,
+            )
+        except tk.TclError:
+            pass
+
+    def _bind_global_mousewheel(self) -> None:
+        self.root.bind_all("<MouseWheel>", self._on_global_mousewheel, add="+")
+        self.root.bind_all("<Button-4>", self._on_global_mousewheel_linux_up, add="+")
+        self.root.bind_all("<Button-5>", self._on_global_mousewheel_linux_down, add="+")
+
+    def _bind_scroll_target(self, widget: tk.Widget | None, callback: typing.Callable[[int], None]) -> None:
+        if widget is None:
+            return
+        widget.bind("<Enter>", lambda _event, cb=callback: self._set_mousewheel_target(cb), add="+")
+        widget.bind("<Leave>", lambda _event: self._clear_mousewheel_target(), add="+")
+
+    def _set_mousewheel_target(self, callback: typing.Callable[[int], None]) -> None:
+        self._mousewheel_target = callback
+
+    def _clear_mousewheel_target(self) -> None:
+        self._mousewheel_target = None
+
+    def _on_global_mousewheel(self, event: tk.Event) -> str | None:
+        if not self._mousewheel_target:
+            return None
+        delta = 1 if event.delta < 0 else -1
+        self._mousewheel_target(delta)
+        return "break"
+
+    def _on_global_mousewheel_linux_up(self, _event: tk.Event) -> str | None:
+        if not self._mousewheel_target:
+            return None
+        self._mousewheel_target(-1)
+        return "break"
+
+    def _on_global_mousewheel_linux_down(self, _event: tk.Event) -> str | None:
+        if not self._mousewheel_target:
+            return None
+        self._mousewheel_target(1)
+        return "break"
 
     def _configure_tree_sorting(self, tree: ttk.Treeview, columns: tuple[str, ...] | list[str]) -> None:
         for col in columns:
@@ -1020,6 +1384,7 @@ class ClaimsManagerApp:
             "customer_name",
             "insurance_company",
             "claim_number",
+            "shop_name",
             "town",
             "date_of_loss",
             "status",
@@ -1032,6 +1397,7 @@ class ClaimsManagerApp:
             ("customer_name", 180),
             ("insurance_company", 170),
             ("claim_number", 140),
+            ("shop_name", 170),
             ("town", 110),
             ("date_of_loss", 100),
             ("status", 90),
@@ -1049,6 +1415,7 @@ class ClaimsManagerApp:
         tree.bind("<ButtonRelease-1>", self.on_claim_selected)
         tree.bind("<Double-1>", self.open_selected_claim_folder)
         tree.bind("<Button-3>", self.show_tree_context_menu)
+        self._bind_scroll_target(tree, lambda delta, current_tree=tree: current_tree.yview_scroll(delta, "units"))
         return tree
 
     def add_folder(self) -> None:
@@ -1149,6 +1516,8 @@ class ClaimsManagerApp:
                         facts_of_loss=previous.get("facts_of_loss", ""),
                         total_loss=previous.get("total_loss", False),
                         shop_name=previous.get("shop_name", ""),
+                        shop_phone=previous.get("shop_phone", ""),
+                        shop_email=previous.get("shop_email", ""),
                         contact_phone=previous.get("contact_phone", ""),
                         contact_email=previous.get("contact_email", ""),
                         assign_pdf_path=previous.get("assign_pdf_path", ""),
@@ -1183,12 +1552,16 @@ class ClaimsManagerApp:
                                 if Path(assign_path).name.lower() == "assign.pdf":
                                     discovered[key]["assign_pdf_path"] = str((renamed_item / "assign.pdf").resolve())
                 self._apply_manual_overrides(discovered[key], previous)
+                self._apply_protected_claim_state(discovered[key], key)
+                self._apply_saved_office_update(discovered[key], key)
                 discovered_records.append(ClaimRecord(**discovered[key]))
 
         for key, item in existing_claims.items():
             if key.startswith("manual::"):
                 discovered[key] = item
-                discovered_records.append(ClaimRecord(**item))
+                self._apply_protected_claim_state(discovered[key], key)
+                self._apply_saved_office_update(discovered[key], key)
+                discovered_records.append(ClaimRecord(**discovered[key]))
 
         enriched = self._enrich_records_from_matches(discovered_records)
         self._classify_records(enriched)
@@ -1197,6 +1570,8 @@ class ClaimsManagerApp:
 
         self.store.save()
         self.refresh_claim_tools_contacts_view()
+        self.refresh_claim_tools_files_view()
+        self.refresh_body_shops_view()
         self.refresh_views(select_key=self.selected_key)
         if show_access_warnings and self.scan_access_issues:
             issue_text = "\n".join(f"- {path}" for path in self.scan_access_issues[:10])
@@ -1230,7 +1605,7 @@ class ClaimsManagerApp:
             return
 
         self.apptrak_import_running = True
-        self.apptrak_status_var.set("Running AppTrak import..." if manual else "Checking AppTrak docs...")
+        self.apptrak_status_var.set("Running AppTrak import..." if manual else "Running scheduled AppTrak import...")
         processed_snapshot = set(self.store.processed_apptrak_pdfs)
 
         def worker() -> None:
@@ -1242,7 +1617,7 @@ class ClaimsManagerApp:
             }
             run_started_at = datetime.now()
             try:
-                if manual and APPTRAK_IMPORT_BAT.exists():
+                if APPTRAK_IMPORT_BAT.exists():
                     self._ensure_apptrak_running()
                     subprocess.run(
                         ["cmd", "/c", str(APPTRAK_IMPORT_BAT)],
@@ -1253,7 +1628,11 @@ class ClaimsManagerApp:
                         timeout=300,
                     )
                     result["import_ran"] = True
-                result["staged"] = self._stage_new_apptrak_pdfs(processed_snapshot, run_started_at if result["import_ran"] else None)
+                result["staged"] = self._stage_new_apptrak_pdfs(
+                    processed_snapshot,
+                    run_started_at if result["import_ran"] else None,
+                    newest_fallback=bool(result["import_ran"]),
+                )
             except Exception as exc:
                 result["error"] = str(exc)
             self.root.after(0, lambda: self._finish_apptrak_import_cycle(result))
@@ -1263,15 +1642,33 @@ class ClaimsManagerApp:
     def _ensure_apptrak_running(self) -> None:
         if not APPTRAK_EXE.exists():
             raise RuntimeError(f"AppTrak executable was not found:\n{APPTRAK_EXE}")
-        if self._is_apptrak_running():
+        if self._is_apptrak_running(require_window=True):
             return
+        if self._is_apptrak_running():
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", "apptrak.exe"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                time.sleep(2)
+            except Exception:
+                pass
         try:
             subprocess.Popen([str(APPTRAK_EXE)], cwd=str(APPTRAK_EXE.parent))
         except Exception as exc:
             raise RuntimeError(f"Could not launch AppTrak:\n{exc}") from exc
-        time.sleep(8)
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if self._is_apptrak_running(require_window=True):
+                time.sleep(5)
+                return
+            time.sleep(1)
+        raise RuntimeError("AppTrak did not finish opening in time.")
 
-    def _is_apptrak_running(self) -> bool:
+    def _is_apptrak_running(self, require_window: bool = False) -> bool:
         try:
             result = subprocess.run(
                 ["tasklist", "/FI", "IMAGENAME eq apptrak.exe"],
@@ -1282,11 +1679,29 @@ class ClaimsManagerApp:
             )
         except Exception:
             return False
-        return "apptrak.exe" in result.stdout.lower()
+        running = "apptrak.exe" in result.stdout.lower()
+        if not running or not require_window:
+            return running
+
+        try:
+            window_result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "(Get-Process apptrak -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 -or $_.MainWindowTitle -ne '' } | Measure-Object).Count",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except Exception:
+            return False
+        return (window_result.stdout or "").strip() not in {"", "0"}
 
     def _finish_apptrak_import_cycle(self, result: dict[str, object]) -> None:
         self.apptrak_import_running = False
-        self._schedule_next_apptrak_check()
 
         manual = bool(result.get("manual"))
         error = str(result.get("error") or "").strip()
@@ -1294,67 +1709,216 @@ class ClaimsManagerApp:
 
         if error:
             self.apptrak_status_var.set("AppTrak import failed.")
-            if manual:
-                messagebox.showerror("AppTrak Import Failed", error)
             return
 
         if staged:
             processed = set(self.store.processed_apptrak_pdfs)
-            processed.update(item["pdf_name"] for item in staged if item.get("pdf_name"))
+            for item in staged:
+                processed_keys = item.get("processed_keys") or []
+                if processed_keys:
+                    processed.update(str(name) for name in processed_keys if name)
+                pdf_names = item.get("pdf_names") or []
+                if pdf_names:
+                    processed.update(str(name) for name in pdf_names if name)
+                elif item.get("pdf_name"):
+                    processed.add(str(item["pdf_name"]))
             self.store.data["processed_apptrak_pdfs"] = sorted(processed)
             self.store.save()
             self.scan_folders(show_access_warnings=False)
-            folder_lines = "\n".join(f"- {item['folder_name']} ({item['pdf_name']})" for item in staged)
-            self.apptrak_status_var.set(f"AppTrak staged {len(staged)} new import(s).")
-            messagebox.showinfo(
-                "AppTrak Imports Ready",
-                f"Staged {len(staged)} new import(s):\n\n{folder_lines}",
+            self.apptrak_status_var.set(
+                f"AppTrak staged {len(staged)} new import(s): "
+                + ", ".join(
+                    f"{item['folder_name']} ({', '.join(item.get('pdf_names') or [item.get('pdf_name', '')])})"
+                    for item in staged
+                )
             )
             return
 
-        self.apptrak_status_var.set("AppTrak checked. No new numeric PDFs found.")
-        if manual:
-            messagebox.showinfo("AppTrak Imports", "No new numeric PDFs were found in AppTrak docs.")
+        self.apptrak_status_var.set("AppTrak checked. No new imports found.")
 
-    def _stage_new_apptrak_pdfs(self, processed_snapshot: set[str], imported_since: datetime | None = None) -> list[dict[str, str]]:
+    def _stage_new_apptrak_pdfs(
+        self,
+        processed_snapshot: set[str],
+        imported_since: datetime | None = None,
+        newest_fallback: bool = False,
+    ) -> list[dict[str, object]]:
         pending_root = self._pending_claims_root()
         if not pending_root:
             raise RuntimeError("Pending Claims folder is not configured.")
-        if not APPTRAK_DOCS_DIR.exists():
-            raise RuntimeError(f"AppTrak docs folder was not found:\n{APPTRAK_DOCS_DIR}")
+        if not APPTRAK_DBF_DIR.exists():
+            raise RuntimeError(f"AppTrak dbf folder was not found:\n{APPTRAK_DBF_DIR}")
 
         pending_root.mkdir(parents=True, exist_ok=True)
-        next_folder_number = self._next_pending_staging_number(pending_root)
-        staged: list[dict[str, str]] = []
-        pdf_paths = sorted(
-            [path for path in APPTRAK_DOCS_DIR.glob("*.pdf") if re.fullmatch(r"\d+", path.stem)],
-            key=lambda path: path.name.lower(),
-        )
-        for pdf_path in pdf_paths:
-            if pdf_path.name in processed_snapshot:
+        staged: list[dict[str, object]] = []
+        existing_ids = {str(record.claim_id or '').strip() for record in self.store.all_claims() if str(record.claim_id or '').strip()}
+        for item in self._recent_apptrak_import_records(imported_since, newest_fallback):
+            claim_id = str(item.get('claim_id') or '').strip()
+            if not claim_id or claim_id in processed_snapshot or claim_id in existing_ids:
                 continue
-            if imported_since is not None:
-                try:
-                    modified_at = datetime.fromtimestamp(pdf_path.stat().st_mtime)
-                except OSError:
-                    continue
-                if modified_at < (imported_since - timedelta(seconds=10)):
-                    continue
-            target_folder = pending_root / str(next_folder_number)
+
+            title = str(item.get('title') or claim_id).strip() or claim_id
+            target_folder = pending_root / title
+            suffix = 2
             while target_folder.exists():
-                next_folder_number += 1
-                target_folder = pending_root / str(next_folder_number)
+                target_folder = pending_root / f"{title} ({suffix})"
+                suffix += 1
             target_folder.mkdir(parents=True, exist_ok=False)
-            shutil.copy2(pdf_path, target_folder / pdf_path.name)
+
+            copied_files: list[str] = []
+            assign_pdf = item.get('assignment_pdf')
+            if isinstance(assign_pdf, Path) and assign_pdf.exists() and assign_pdf.is_file():
+                shutil.copy2(assign_pdf, target_folder / assign_pdf.name)
+                copied_files.append(assign_pdf.name)
+
             staged.append(
                 {
-                    "pdf_name": pdf_path.name,
-                    "folder_name": target_folder.name,
-                    "folder_path": str(target_folder),
+                    'claim_id': claim_id,
+                    'folder_name': target_folder.name,
+                    'folder_path': str(target_folder),
+                    'pdf_names': copied_files,
+                    'processed_keys': [claim_id],
                 }
             )
-            next_folder_number += 1
         return staged
+
+    def _recent_apptrak_import_records(
+        self,
+        imported_since: datetime | None = None,
+        newest_fallback: bool = False,
+    ) -> list[dict[str, object]]:
+        apprroot_rows = self._read_dbf_rows(APPTRAK_DBF_DIR / 'apprroot.dbf')
+        apprname_rows = self._read_dbf_rows(APPTRAK_DBF_DIR / 'apprname.dbf')
+        apprveh_rows = self._read_dbf_rows(APPTRAK_DBF_DIR / 'apprveh.dbf')
+        if not apprroot_rows:
+            return []
+
+        names_by_tag: dict[str, list[dict[str, str]]] = {}
+        for row in apprname_rows:
+            tag = str(row.get('NAMTAG') or '').strip()
+            if tag:
+                names_by_tag.setdefault(tag, []).append(row)
+
+        veh_by_tag: dict[str, dict[str, str]] = {}
+        for row in apprveh_rows:
+            tag = str(row.get('VEHTAG') or '').strip()
+            if tag:
+                veh_by_tag[tag] = row
+
+        recent_cutoff = imported_since - timedelta(seconds=20) if imported_since else None
+        candidates: list[dict[str, object]] = []
+        for row in apprroot_rows:
+            claim_id = str(row.get('APRNO') or '').strip()
+            if not re.fullmatch(r'26\d+', claim_id):
+                continue
+            tag = str(row.get('APRTAG') or '').strip() or f"{claim_id}{str(row.get('APRSEQ') or '00').zfill(2)}"
+            canonical_name = f"{claim_id[3:]}.pdf"
+            assignment_pdf = APPTRAK_DOCS_DIR / canonical_name
+            if not assignment_pdf.exists() or not assignment_pdf.is_file():
+                continue
+            related_times = [datetime.fromtimestamp(assignment_pdf.stat().st_mtime)]
+            if APPTRAK_PICS_DIR.exists():
+                for photo in APPTRAK_PICS_DIR.glob(f"{tag}-*.jpg"):
+                    related_times.append(datetime.fromtimestamp(photo.stat().st_mtime))
+            last_activity = max(related_times)
+            if recent_cutoff and last_activity < recent_cutoff:
+                continue
+
+            owner_rows = names_by_tag.get(claim_id, [])
+            owner = next((entry for entry in owner_rows if str(entry.get('NAMTYPE') or '').strip().upper() == 'O'), None)
+            insured = next((entry for entry in owner_rows if str(entry.get('NAMTYPE') or '').strip().upper() == 'I'), None)
+            chosen = owner or insured or {}
+            first = str(chosen.get('NAMFIRST') or '').strip()
+            last = str(chosen.get('NAMLAST') or '').strip()
+            display_name = ' '.join(part for part in (first, last) if part).strip() or last or first or claim_id
+            display_name = self._sanitize_folder_part(display_name)
+            candidates.append(
+                {
+                    'claim_id': claim_id,
+                    'title': f"{claim_id} - {display_name}",
+                    'assignment_pdf': assignment_pdf,
+                    'last_activity': last_activity,
+                }
+            )
+
+        candidates.sort(key=lambda item: item['last_activity'])
+        if candidates:
+            return candidates
+
+        if newest_fallback:
+            fallback_candidates: list[dict[str, object]] = []
+            for row in apprroot_rows:
+                claim_id = str(row.get('APRNO') or '').strip()
+                if not re.fullmatch(r'26\d+', claim_id):
+                    continue
+                assignment_pdf = APPTRAK_DOCS_DIR / f"{claim_id[3:]}.pdf"
+                if not assignment_pdf.exists() or not assignment_pdf.is_file():
+                    continue
+                tag = str(row.get('APRTAG') or '').strip() or f"{claim_id}{str(row.get('APRSEQ') or '00').zfill(2)}"
+                related_times = [datetime.fromtimestamp(assignment_pdf.stat().st_mtime)]
+                if APPTRAK_PICS_DIR.exists():
+                    for photo in APPTRAK_PICS_DIR.glob(f"{tag}-*.jpg"):
+                        related_times.append(datetime.fromtimestamp(photo.stat().st_mtime))
+                last_activity = max(related_times)
+                owner_rows = names_by_tag.get(claim_id, [])
+                owner = next((entry for entry in owner_rows if str(entry.get('NAMTYPE') or '').strip().upper() == 'O'), None)
+                insured = next((entry for entry in owner_rows if str(entry.get('NAMTYPE') or '').strip().upper() == 'I'), None)
+                chosen = owner or insured or {}
+                first = str(chosen.get('NAMFIRST') or '').strip()
+                last = str(chosen.get('NAMLAST') or '').strip()
+                display_name = ' '.join(part for part in (first, last) if part).strip() or last or first or claim_id
+                display_name = self._sanitize_folder_part(display_name)
+                fallback_candidates.append(
+                    {
+                        'claim_id': claim_id,
+                        'title': f"{claim_id} - {display_name}",
+                        'assignment_pdf': assignment_pdf,
+                        'last_activity': last_activity,
+                    }
+                )
+            if fallback_candidates:
+                return [max(fallback_candidates, key=lambda item: item['last_activity'])]
+        return []
+
+    def _read_dbf_rows(self, path: Path) -> list[dict[str, str]]:
+        if not path.exists() or not path.is_file():
+            return []
+        try:
+            with path.open('rb') as handle:
+                header = handle.read(32)
+                if len(header) < 32:
+                    return []
+                num_records = struct.unpack('<I', header[4:8])[0]
+                header_len = struct.unpack('<H', header[8:10])[0]
+                record_len = struct.unpack('<H', header[10:12])[0]
+                fields: list[tuple[str, int]] = []
+                while True:
+                    desc = handle.read(32)
+                    if not desc or desc[0] == 0x0D:
+                        break
+                    name = desc[:11].split(b'\x00', 1)[0].decode('ascii', 'ignore').strip()
+                    flen = desc[16]
+                    fields.append((name, flen))
+                handle.seek(header_len)
+                rows: list[dict[str, str]] = []
+                for _ in range(num_records):
+                    record = handle.read(record_len)
+                    if not record or record[0] == 0x2A:
+                        continue
+                    pos = 1
+                    row: dict[str, str] = {}
+                    for name, flen in fields:
+                        raw = record[pos:pos + flen]
+                        pos += flen
+                        row[name] = raw.decode('latin1', 'ignore').strip().strip('\x00')
+                    rows.append(row)
+                return rows
+        except Exception:
+            return []
+
+    def _sanitize_folder_part(self, value: str) -> str:
+        cleaned = re.sub(r'[\/:*?"<>|]+', ' ', value or '')
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip(' .-_')
+        return cleaned or 'UNKNOWN'
 
     def _pending_claims_root(self) -> Path | None:
         for folder in self.store.watched_folders:
@@ -1454,6 +2018,23 @@ class ClaimsManagerApp:
             return
         for field_name, value in overrides.items():
             target[field_name] = value
+
+    def _apply_saved_office_update(self, target: dict, claim_key: str) -> None:
+        office_update = self.store.office_updates.get(claim_key, {}) or {}
+        if not isinstance(office_update, dict):
+            return
+        for field_name in ("office_appt_when", "office_progress_status", "office_waiting_for_paperwork", "office_additional_notes"):
+            if field_name in office_update:
+                target[field_name] = office_update.get(field_name, target.get(field_name, ""))
+
+    def _apply_protected_claim_state(self, target: dict, claim_key: str) -> None:
+        saved_state = self.store.get_saved_claim_state(
+            claim_key=claim_key,
+            claim_id=target.get("claim_id", ""),
+            source_path=target.get("source_path", ""),
+        )
+        if saved_state:
+            self.store.apply_saved_claim_state(target, saved_state)
 
     def _extract_claim_details(self, claim_item: Path) -> dict[str, str]:
         if not claim_item.is_dir() or PdfReader is None:
@@ -1561,14 +2142,17 @@ class ClaimsManagerApp:
         vehicle_location_name_match = re.search(r"Vehicle Location Name\s*:\s*([^\n]+)", normalized_text, re.IGNORECASE)
         vehicle_location_match = re.search(r"Vehicle Location\s*:\s*([^\n]+)", normalized_text, re.IGNORECASE)
         vehicle_location_phone_match = re.search(r"Vehicle Location[\s\S]{0,200}?Phone\s*:\s*\(?(\d{3})\)?[-.\s]*(\d{3})[-.\s]*(\d{4})", normalized_text, re.IGNORECASE)
+        vehicle_location_email_match = re.search(r"Vehicle Location[\s\S]{0,250}?Email\s*:\s*([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", normalized_text, re.IGNORECASE)
         if vehicle_location_name_match:
             details["shop_name"] = vehicle_location_name_match.group(1).strip()
         if vehicle_location_match:
             details["location_of_vehicle"] = " ".join(vehicle_location_match.group(1).split())
             if not details.get("shop_name"):
                 details["shop_name"] = details["location_of_vehicle"]
-        if vehicle_location_phone_match and not details.get("contact_phone"):
-            details["contact_phone"] = f"{vehicle_location_phone_match.group(1)}-{vehicle_location_phone_match.group(2)}-{vehicle_location_phone_match.group(3)}"
+        if vehicle_location_phone_match:
+            details["shop_phone"] = f"{vehicle_location_phone_match.group(1)}-{vehicle_location_phone_match.group(2)}-{vehicle_location_phone_match.group(3)}"
+        if vehicle_location_email_match:
+            details["shop_email"] = vehicle_location_email_match.group(1).strip()
 
         owner_block = self._extract_labeled_section(
             normalized_text,
@@ -1747,6 +2331,10 @@ class ClaimsManagerApp:
         if shop_match:
             details["shop_name"] = shop_match.group(1).strip()
 
+        shop_phone_match = re.search(r"Place of Inspection:[\s\S]{0,150}?Cell:\s*\((\d{3})\)\s*(\d{3})-(\d{4})", text, re.IGNORECASE)
+        if shop_phone_match:
+            details["shop_phone"] = f"{shop_phone_match.group(1)}-{shop_phone_match.group(2)}-{shop_phone_match.group(3)}"
+
         if re.search(r"Settlement Type:\s*Total Loss", text, re.IGNORECASE) or re.search(r"Total loss threshold reached", text, re.IGNORECASE):
             details["total_loss"] = True
 
@@ -1771,6 +2359,8 @@ class ClaimsManagerApp:
         shop_name = ""
         contact_phone = ""
         contact_email = ""
+        shop_phone = ""
+        shop_email = ""
         assignment_claim_notes = ""
 
         def clean_line(value: str) -> str:
@@ -1883,6 +2473,7 @@ class ClaimsManagerApp:
         shop_match = re.search(r"\(\s*[A-Z0-9]+\s*\)\s*\n([^\n]+)\n([^\n]+)\n([^\n]+)\n([\d-]+)", text)
         if shop_match:
             shop_name = clean_line(shop_match.group(1))
+            shop_phone = clean_line(shop_match.group(4))
         if location_of_vehicle and not shop_name:
             shop_name = location_of_vehicle
 
@@ -1981,6 +2572,8 @@ class ClaimsManagerApp:
             "damage_description": damage_description,
             "facts_of_loss": facts_of_loss,
             "shop_name": shop_name,
+            "shop_phone": shop_phone,
+            "shop_email": shop_email,
             "contact_phone": contact_phone,
             "contact_email": contact_email,
             "assignment_claim_notes": assignment_claim_notes,
@@ -2021,7 +2614,7 @@ class ClaimsManagerApp:
 
         email_match = re.search(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", text, re.IGNORECASE)
         if email_match:
-            details["contact_email"] = email_match.group(0)
+            details["shop_email"] = email_match.group(0)
 
         estimate_shop_match = re.search(
             r"(?:MY WAY AUTO BODY|[A-Z][A-Za-z0-9&'.,\- ]+(?:AUTO BODY|BODY SHOP|COLLISION|COLLISION CENTER|MOTORS|SERVICE|REPAIR SERVICE|REPAIR))",
@@ -2069,6 +2662,8 @@ class ClaimsManagerApp:
                     "vehicle",
                     "vin",
                     "shop_name",
+                    "shop_phone",
+                    "shop_email",
                     "contact_phone",
                     "contact_email",
                 ]:
@@ -2110,6 +2705,49 @@ class ClaimsManagerApp:
         cleaned = re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
         tokens = [token for token in cleaned.split() if token not in {"supp", "supplement", "inreview", "ready4review", "waiting4review", "closed", "claims"}]
         return " ".join(tokens)
+
+    def _normalized_shop_name(self, value: str) -> str:
+        cleaned = re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+        tokens = [
+            token
+            for token in cleaned.split()
+            if token not in {
+                "inc",
+                "llc",
+                "co",
+                "corp",
+                "corporation",
+                "company",
+                "the",
+                "auto",
+                "body",
+                "shop",
+                "collision",
+                "center",
+                "service",
+                "repair",
+            }
+        ]
+        return " ".join(tokens)
+
+    def _find_body_shop_entry(self, shop_name: str) -> dict[str, str] | None:
+        target = self._normalized_shop_name(shop_name)
+        if not target:
+            return None
+
+        exact_match: dict[str, str] | None = None
+        partial_match: dict[str, str] | None = None
+        for entry in self.store.body_shop_database:
+            candidate_name = (entry.get("shop_name") or "").strip()
+            candidate = self._normalized_shop_name(candidate_name)
+            if not candidate:
+                continue
+            if candidate == target:
+                exact_match = entry
+                break
+            if candidate in target or target in candidate:
+                partial_match = partial_match or entry
+        return exact_match or partial_match
 
     def _classify_records(self, records: list[ClaimRecord]) -> None:
         groups: dict[str, list[ClaimRecord]] = {}
@@ -2781,6 +3419,7 @@ class ClaimsManagerApp:
                 or search in record.vehicle.lower()
                 or search in record.vin.lower()
                 or search in record.shop_name.lower()
+                or search in record.shop_email.lower()
                 or search in record.contact_phone.lower()
                 or search in record.contact_email.lower()
             ]
@@ -2797,7 +3436,7 @@ class ClaimsManagerApp:
         self.summary_vars["closed"].set(str(len(filtered["closed"])))
         self._update_closed_stats(records)
         self._refresh_office_updates(filtered["open"])
-        self._refresh_route_planner(filtered["open"])
+        self._refresh_route_planner(all_records)
 
         for name, tree in self.treeviews.items():
             tree.delete(*tree.get_children())
@@ -2811,6 +3450,7 @@ class ClaimsManagerApp:
                         record.customer_name or record.title,
                         record.insurance_company,
                         record.claim_number,
+                        record.shop_name,
                         record.town,
                         record.date_of_loss,
                         record.status,
@@ -2845,6 +3485,7 @@ class ClaimsManagerApp:
                 values=(
                     record.claim_id,
                     record.customer_name or record.title,
+                    record.shop_name or "-",
                     record.office_progress_status or "No update",
                     record.office_appt_when,
                 ),
@@ -2912,7 +3553,14 @@ class ClaimsManagerApp:
         manual_overrides["office_waiting_for_paperwork"] = record.office_waiting_for_paperwork
         manual_overrides["office_additional_notes"] = record.office_additional_notes
         record.manual_overrides = manual_overrides
+        self.store.office_updates[record.key] = {
+            "office_appt_when": record.office_appt_when,
+            "office_progress_status": record.office_progress_status,
+            "office_waiting_for_paperwork": record.office_waiting_for_paperwork,
+            "office_additional_notes": record.office_additional_notes,
+        }
         record.updated_at = now_stamp()
+        self.store.save_claim_state(record)
         self.store.upsert_claim(record)
         self.store.save()
         if record.office_appt_when and record.office_appt_when != previous_appt_when:
@@ -2996,7 +3644,20 @@ class ClaimsManagerApp:
             return
         try:
             pdf_path = self._generate_detailed_office_update_pdf(records, title="Uninspected Open Claims", base_name_prefix="Uninspected Open Claims")
-            self._send_office_update_email_to_self(pdf_path, subject="Uninspected Open Claims")
+            extra_attachments: list[tuple[Path, str | None]] = []
+            for record in records:
+                assign_path = self._find_assignment_sheet_path(record)
+                if not assign_path:
+                    continue
+                suffix = assign_path.suffix.lower() or ".pdf"
+                last_name = self._customer_last_name(record)
+                attachment_name = f"{last_name}-assign{suffix}" if last_name else assign_path.name
+                extra_attachments.append((assign_path, attachment_name))
+            self._send_office_update_email_to_self(
+                pdf_path,
+                subject="Uninspected Open Claims",
+                extra_attachments=extra_attachments,
+            )
         except Exception as exc:
             messagebox.showerror("Export Failed", f"Could not create office update PDF:\n{exc}")
             return
@@ -3071,13 +3732,13 @@ class ClaimsManagerApp:
 
         columns = [
             "Job #",
+            "Claim #",
             "Customer",
+            "Vehicle",
             "Insurance",
             "Address",
             "Phone",
             "Progress",
-            "Inspection",
-            "Paperwork",
             "Appraisal Notes",
             "Claim Notes",
             "Additional Notes",
@@ -3091,13 +3752,13 @@ class ClaimsManagerApp:
         for record in open_records:
             row = table.add_row().cells
             row[0].text = record.claim_id or "-"
-            row[1].text = record.customer_name or record.title or "-"
-            row[2].text = record.insurance_company or "-"
-            row[3].text = record.owner_address or record.location_of_vehicle or record.town or "-"
-            row[4].text = record.contact_phone or "-"
-            row[5].text = record.office_progress_status or "-"
-            row[6].text = record.office_appt_when or "-"
-            row[7].text = record.office_waiting_for_paperwork or "-"
+            row[1].text = record.claim_number or "-"
+            row[2].text = record.customer_name or record.title or "-"
+            row[3].text = record.vehicle or "-"
+            row[4].text = record.insurance_company or "-"
+            row[5].text = self._route_default_address(record) or "-"
+            row[6].text = record.contact_phone or "-"
+            row[7].text = record.office_progress_status or "-"
             row[8].text = record.assignment_claim_notes or "-"
             row[9].text = record.notes or "-"
             row[10].text = record.office_additional_notes or ""
@@ -3132,7 +3793,12 @@ class ClaimsManagerApp:
             smtp.login(sender_email, app_password)
             smtp.send_message(message)
 
-    def _send_office_update_email_to_self(self, attachment_path: Path, subject: str | None = None) -> None:
+    def _send_office_update_email_to_self(
+        self,
+        attachment_path: Path,
+        subject: str | None = None,
+        extra_attachments: list[tuple[Path, str | None]] | None = None,
+    ) -> None:
         sender_email, app_password = self._get_office_update_email_credentials()
         if not sender_email or not app_password:
             raise RuntimeError("A Gmail address and app password are required for office update email.")
@@ -3148,6 +3814,19 @@ class ClaimsManagerApp:
             subtype="pdf",
             filename=attachment_path.name,
         )
+        for extra_path, attachment_name in extra_attachments or []:
+            try:
+                if not extra_path.exists() or not extra_path.is_file():
+                    continue
+                suffix = extra_path.suffix.lower().lstrip(".") or "pdf"
+                message.add_attachment(
+                    extra_path.read_bytes(),
+                    maintype="application",
+                    subtype=suffix,
+                    filename=attachment_name or extra_path.name,
+                )
+            except OSError:
+                continue
 
         context = ssl.create_default_context()
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
@@ -3156,6 +3835,17 @@ class ClaimsManagerApp:
             smtp.ehlo()
             smtp.login(sender_email, app_password)
             smtp.send_message(message)
+
+    def _customer_last_name(self, record: ClaimRecord) -> str:
+        customer = (record.customer_name or record.title or "").strip()
+        if not customer:
+            return ""
+        if "," in customer:
+            return re.sub(r"[^A-Za-z0-9-]", "", customer.split(",", 1)[0].strip())
+        tokens = [token for token in re.split(r"\s+", customer) if token]
+        if not tokens:
+            return ""
+        return re.sub(r"[^A-Za-z0-9-]", "", tokens[-1])
 
     def _get_uninspected_records_for_self_copy(self) -> list[ClaimRecord]:
         records: list[ClaimRecord] = []
@@ -3592,18 +4282,34 @@ class ClaimsManagerApp:
         optimized_pairs.sort(key=lambda item: item[0])
         return [key for _, key in optimized_pairs]
 
-    def _refresh_route_planner(self, open_records: list[ClaimRecord]) -> None:
+    def _refresh_route_planner(self, all_records: list[ClaimRecord]) -> None:
         if not self.route_available_tree or not self.route_selected_tree:
             return
         self.route_available_tree.delete(*self.route_available_tree.get_children())
         self.route_selected_tree.delete(*self.route_selected_tree.get_children())
 
-        route_keys = [key for key in self.store.route_plan_keys if any(record.key == key for record in open_records)]
+        records_by_key = {record.key: record for record in all_records}
+        route_keys = [key for key in self.store.route_plan_keys if key in records_by_key]
         if route_keys != self.store.route_plan_keys:
             self.store.data["route_plan_keys"] = route_keys
             self.store.save()
 
-        for record in open_records:
+        route_status_filter = (self.route_claim_status_filter_var.get() or "Open").strip().lower()
+        route_records = list(all_records)
+        if route_status_filter == "open":
+            route_records = [record for record in route_records if record.status == "Open"]
+        elif route_status_filter == "closed":
+            route_records = [record for record in route_records if record.status == "Closed"]
+
+        if self.route_appt_only_var.get():
+            route_records = [
+                record
+                for record in route_records
+                if (record.office_progress_status or "").strip().lower() == "appointment scheduled"
+            ]
+
+        available_records = [record for record in route_records if record.key not in route_keys]
+        for record in available_records:
             self.route_available_tree.insert(
                 "",
                 tk.END,
@@ -3612,7 +4318,7 @@ class ClaimsManagerApp:
             )
 
         for index, key in enumerate(route_keys, start=1):
-            record = self.store.get_claim(key)
+            record = records_by_key.get(key) or self.store.get_claim(key)
             if not record:
                 continue
             self.route_selected_tree.insert(
@@ -3664,6 +4370,7 @@ class ClaimsManagerApp:
         if not record:
             return
         record.route_address_override = self.route_address_var.get().strip()
+        self.store.save_claim_state(record)
         self.store.upsert_claim(record)
         self.store.save()
         self.refresh_views(select_key=record.key)
@@ -3905,6 +4612,40 @@ class ClaimsManagerApp:
             self.claim_tools_contacts_tree.insert("", "end", iid=str(index), values=(name, number, prompt_guide, notes))
         self._apply_saved_tree_sort(self.claim_tools_contacts_tree)
 
+    def refresh_claim_tools_files_view(self) -> None:
+        if not self.claim_tools_files_tree:
+            return
+        self.claim_tools_files_tree.delete(*self.claim_tools_files_tree.get_children())
+        for index, entry in enumerate(self.store.claim_tools_files):
+            section = (entry.get("section") or "").strip()
+            label = (entry.get("label") or "").strip()
+            file_path = (entry.get("file_path") or "").strip()
+            file_name = Path(file_path).name if file_path else ""
+            notes = " ".join((entry.get("notes") or "").split())
+            self.claim_tools_files_tree.insert("", "end", iid=str(index), values=(section, label, file_name, notes))
+        self._apply_saved_tree_sort(self.claim_tools_files_tree)
+
+    def refresh_body_shops_view(self) -> None:
+        if not self.body_shops_tree:
+            return
+        self.body_shops_tree.delete(*self.body_shops_tree.get_children())
+        for index, entry in enumerate(self.store.body_shop_database):
+            self.body_shops_tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(
+                    (entry.get("shop_name") or "").strip(),
+                    (entry.get("contact_name") or "").strip(),
+                    (entry.get("phone") or "").strip(),
+                    (entry.get("email") or "").strip(),
+                    (entry.get("body_rate") or "").strip(),
+                    (entry.get("paint_rate") or "").strip(),
+                    " ".join((entry.get("certifications") or "").split()),
+                ),
+            )
+        self._apply_saved_tree_sort(self.body_shops_tree)
+
     def _prompt_claim_tool_contact(
         self,
         title: str,
@@ -3982,6 +4723,224 @@ class ClaimsManagerApp:
         self.root.wait_window(dialog)
         return result["value"]
 
+    def _prompt_claim_tool_file(
+        self,
+        title: str,
+        initial_section: str = "",
+        initial_label: str = "",
+        initial_file_path: str = "",
+        initial_notes: str = "",
+    ) -> dict[str, str] | None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.minsize(640, 320)
+        dialog.resizable(True, True)
+
+        result: dict[str, dict[str, str] | None] = {"value": None}
+        section_var = tk.StringVar(value=initial_section or "Shop Labor Rate Photos")
+        label_var = tk.StringVar(value=initial_label)
+        file_var = tk.StringVar(value=initial_file_path)
+
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(3, weight=1)
+
+        ttk.Label(frame, text="Section").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+        section_combo = ttk.Combobox(
+            frame,
+            textvariable=section_var,
+            values=("Shop Labor Rate Photos", "Position Statements", "Shop Certifications", "Other"),
+        )
+        section_combo.grid(row=0, column=1, sticky="ew", pady=(0, 8))
+
+        ttk.Label(frame, text="Label").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+        label_entry = ttk.Entry(frame, textvariable=label_var)
+        label_entry.grid(row=1, column=1, sticky="ew", pady=(0, 8))
+
+        ttk.Label(frame, text="File").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+        file_row = ttk.Frame(frame)
+        file_row.grid(row=2, column=1, sticky="ew", pady=(0, 8))
+        file_row.columnconfigure(0, weight=1)
+        file_entry = ttk.Entry(file_row, textvariable=file_var)
+        file_entry.grid(row=0, column=0, sticky="ew")
+
+        def browse_file() -> None:
+            selected = filedialog.askopenfilename(
+                title="Select Claim Tool File",
+                initialdir=self.store.claim_tools_folder,
+                filetypes=[("All Files", "*.*")],
+            )
+            if not selected:
+                return
+            file_var.set(selected)
+            if not label_var.get().strip():
+                label_var.set(Path(selected).stem)
+
+        ttk.Button(file_row, text="Browse", command=browse_file).grid(row=0, column=1, padx=(8, 0))
+
+        ttk.Label(frame, text="Notes").grid(row=3, column=0, sticky="nw", padx=(0, 8))
+        notes_text = tk.Text(frame, height=5, wrap="word")
+        notes_text.grid(row=3, column=1, sticky="nsew")
+        notes_text.insert("1.0", initial_notes or "")
+
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=4, column=0, columnspan=2, sticky="e", pady=(12, 0))
+
+        def submit() -> None:
+            section = section_var.get().strip()
+            label = label_var.get().strip()
+            file_path = file_var.get().strip()
+            notes = notes_text.get("1.0", tk.END).strip()
+            if not section:
+                messagebox.showinfo("Section Required", "Choose or enter a section first.", parent=dialog)
+                return
+            if not label:
+                messagebox.showinfo("Label Required", "Enter a label first.", parent=dialog)
+                return
+            if not file_path:
+                messagebox.showinfo("File Required", "Choose a file first.", parent=dialog)
+                return
+            result["value"] = {
+                "section": section,
+                "label": label,
+                "file_path": file_path,
+                "notes": notes,
+            }
+            self._remember_dialog_geometry(dialog)
+            dialog.destroy()
+
+        def cancel() -> None:
+            result["value"] = None
+            self._remember_dialog_geometry(dialog)
+            dialog.destroy()
+
+        ttk.Button(button_row, text="Save", command=submit).pack(side="left", padx=(0, 8))
+        ttk.Button(button_row, text="Cancel", command=cancel).pack(side="left")
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.update_idletasks()
+        self._place_dialog(dialog)
+        section_combo.focus_set()
+        self.root.wait_window(dialog)
+        return result["value"]
+
+    def _prompt_body_shop_entry(
+        self,
+        title: str,
+        initial_shop_name: str = "",
+        initial_contact_name: str = "",
+        initial_phone: str = "",
+        initial_email: str = "",
+        initial_address: str = "",
+        initial_body_rate: str = "",
+        initial_paint_rate: str = "",
+        initial_frame_rate: str = "",
+        initial_mechanical_rate: str = "",
+        initial_certifications: str = "",
+        initial_negotiation_notes: str = "",
+        initial_notes: str = "",
+    ) -> dict[str, str] | None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.resizable(True, True)
+        dialog.geometry("860x620")
+        dialog.grab_set()
+
+        result: dict[str, dict[str, str] | None] = {"value": None}
+        values = {
+            "shop_name": tk.StringVar(value=initial_shop_name),
+            "contact_name": tk.StringVar(value=initial_contact_name),
+            "phone": tk.StringVar(value=initial_phone),
+            "email": tk.StringVar(value=initial_email),
+            "address": tk.StringVar(value=initial_address),
+            "body_rate": tk.StringVar(value=initial_body_rate),
+            "paint_rate": tk.StringVar(value=initial_paint_rate),
+            "frame_rate": tk.StringVar(value=initial_frame_rate),
+            "mechanical_rate": tk.StringVar(value=initial_mechanical_rate),
+        }
+
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(9, weight=1)
+        frame.rowconfigure(10, weight=1)
+        frame.rowconfigure(11, weight=1)
+
+        row = 0
+        for label_text, key in [
+            ("Shop Name", "shop_name"),
+            ("Contact Name", "contact_name"),
+            ("Phone", "phone"),
+            ("Email", "email"),
+            ("Address", "address"),
+            ("Body Rate", "body_rate"),
+            ("Paint Rate", "paint_rate"),
+            ("Frame Rate", "frame_rate"),
+            ("Mechanical Rate", "mechanical_rate"),
+        ]:
+            ttk.Label(frame, text=label_text).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+            ttk.Entry(frame, textvariable=values[key]).grid(row=row, column=1, sticky="ew", pady=(0, 8))
+            row += 1
+
+        ttk.Label(frame, text="Certifications").grid(row=9, column=0, sticky="nw", padx=(0, 8), pady=(0, 8))
+        certifications_text = tk.Text(frame, height=4, wrap="word")
+        certifications_text.grid(row=9, column=1, sticky="nsew", pady=(0, 8))
+        certifications_text.insert("1.0", initial_certifications or "")
+
+        ttk.Label(frame, text="Negotiation Notes").grid(row=10, column=0, sticky="nw", padx=(0, 8), pady=(0, 8))
+        negotiation_text = tk.Text(frame, height=5, wrap="word")
+        negotiation_text.grid(row=10, column=1, sticky="nsew", pady=(0, 8))
+        negotiation_text.insert("1.0", initial_negotiation_notes or "")
+
+        ttk.Label(frame, text="Notes").grid(row=11, column=0, sticky="nw", padx=(0, 8))
+        notes_text = tk.Text(frame, height=5, wrap="word")
+        notes_text.grid(row=11, column=1, sticky="nsew")
+        notes_text.insert("1.0", initial_notes or "")
+
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=12, column=0, columnspan=2, sticky="e", pady=(12, 0))
+
+        def submit() -> None:
+            shop_name = values["shop_name"].get().strip()
+            if not shop_name:
+                messagebox.showinfo("Shop Name Required", "Enter the shop name first.", parent=dialog)
+                return
+            result["value"] = {
+                "shop_name": shop_name,
+                "contact_name": values["contact_name"].get().strip(),
+                "phone": values["phone"].get().strip(),
+                "email": values["email"].get().strip(),
+                "address": values["address"].get().strip(),
+                "body_rate": values["body_rate"].get().strip(),
+                "paint_rate": values["paint_rate"].get().strip(),
+                "frame_rate": values["frame_rate"].get().strip(),
+                "mechanical_rate": values["mechanical_rate"].get().strip(),
+                "certifications": certifications_text.get("1.0", tk.END).strip(),
+                "negotiation_notes": negotiation_text.get("1.0", tk.END).strip(),
+                "notes": notes_text.get("1.0", tk.END).strip(),
+            }
+            self._remember_dialog_geometry(dialog)
+            dialog.destroy()
+
+        def cancel() -> None:
+            result["value"] = None
+            self._remember_dialog_geometry(dialog)
+            dialog.destroy()
+
+        ttk.Button(button_row, text="Save", command=submit).pack(side="left", padx=(0, 8))
+        ttk.Button(button_row, text="Cancel", command=cancel).pack(side="left")
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.update_idletasks()
+        self._place_dialog(dialog)
+        frame.focus_set()
+        self.root.wait_window(dialog)
+        return result["value"]
+
     def add_claim_tool_contact(self) -> None:
         result = self._prompt_claim_tool_contact("Add Claim Tool Contact")
         if result is None:
@@ -4025,6 +4984,113 @@ class ClaimsManagerApp:
         self.store.save()
         self.refresh_claim_tools_contacts_view()
 
+    def add_claim_tool_file(self) -> None:
+        result = self._prompt_claim_tool_file("Add Claim Tool File")
+        if result is None:
+            return
+        self.store.claim_tools_files.append(result)
+        self.store.save()
+        self.refresh_claim_tools_files_view()
+
+    def edit_claim_tool_file(self) -> None:
+        if not self.claim_tools_files_tree:
+            return
+        selection = self.claim_tools_files_tree.selection()
+        if not selection:
+            messagebox.showinfo("No Selection", "Select a file entry first.")
+            return
+        index = int(selection[0])
+        entry = self.store.claim_tools_files[index]
+        result = self._prompt_claim_tool_file(
+            "Edit Claim Tool File",
+            entry.get("section", ""),
+            entry.get("label", ""),
+            entry.get("file_path", ""),
+            entry.get("notes", ""),
+        )
+        if result is None:
+            return
+        self.store.claim_tools_files[index] = result
+        self.store.save()
+        self.refresh_claim_tools_files_view()
+        self.claim_tools_files_tree.selection_set(str(index))
+
+    def remove_claim_tool_file(self) -> None:
+        if not self.claim_tools_files_tree:
+            return
+        selection = self.claim_tools_files_tree.selection()
+        if not selection:
+            messagebox.showinfo("No Selection", "Select a file entry first.")
+            return
+        index = int(selection[0])
+        del self.store.claim_tools_files[index]
+        self.store.save()
+        self.refresh_claim_tools_files_view()
+
+    def open_claim_tool_file_entry(self, _event: object | None = None) -> None:
+        if not self.claim_tools_files_tree:
+            return
+        selection = self.claim_tools_files_tree.selection()
+        if not selection:
+            return
+        index = int(selection[0])
+        entry = self.store.claim_tools_files[index]
+        file_path = Path((entry.get("file_path") or "").strip())
+        if not file_path:
+            return
+        self._open_claim_tool_file(file_path)
+
+    def add_body_shop_entry(self) -> None:
+        result = self._prompt_body_shop_entry("Add Body Shop")
+        if result is None:
+            return
+        self.store.body_shop_database.append(result)
+        self.store.save()
+        self.refresh_body_shops_view()
+
+    def edit_body_shop_entry(self) -> None:
+        if not self.body_shops_tree:
+            return
+        selection = self.body_shops_tree.selection()
+        if not selection:
+            messagebox.showinfo("No Selection", "Select a body shop first.")
+            return
+        index = int(selection[0])
+        entry = self.store.body_shop_database[index]
+        result = self._prompt_body_shop_entry(
+            "Edit Body Shop",
+            entry.get("shop_name", ""),
+            entry.get("contact_name", ""),
+            entry.get("phone", ""),
+            entry.get("email", ""),
+            entry.get("address", ""),
+            entry.get("body_rate", ""),
+            entry.get("paint_rate", ""),
+            entry.get("frame_rate", ""),
+            entry.get("mechanical_rate", ""),
+            entry.get("certifications", ""),
+            entry.get("negotiation_notes", ""),
+            entry.get("notes", ""),
+        )
+        if result is None:
+            return
+        self.store.body_shop_database[index] = result
+        self.store.save()
+        self.refresh_body_shops_view()
+        self.body_shops_tree.selection_set(str(index))
+
+    def remove_body_shop_entry(self) -> None:
+        if not self.body_shops_tree:
+            return
+        selection = self.body_shops_tree.selection()
+        if not selection:
+            messagebox.showinfo("No Selection", "Select a body shop first.")
+            return
+        index = int(selection[0])
+        del self.store.body_shop_database[index]
+        self.store.save()
+        self.refresh_body_shops_view()
+
     def call_claim_tool_contact(self, _event: object | None = None) -> None:
         if not self.claim_tools_contacts_tree:
             return
@@ -4041,6 +5107,34 @@ class ClaimsManagerApp:
         tel_number = re.sub(r"[^0-9+#*,;]", "", number)
         if not tel_number:
             messagebox.showinfo("Invalid Number", "This number cannot be used for a call action.")
+            return
+
+        try:
+            os.startfile(f"tel:{tel_number}")
+        except Exception:
+            messagebox.showinfo(
+                "Call Not Available",
+                f"Windows could not start a call for:\n{number}\n\nIf a calling app is installed later, this should work.",
+            )
+
+    def call_body_shop_phone(self, _event: object | None = None) -> None:
+        if not self.body_shops_tree:
+            return
+        selection = self.body_shops_tree.selection()
+        if not selection:
+            return
+        index = int(selection[0])
+        if index < 0 or index >= len(self.store.body_shop_database):
+            return
+        entry = self.store.body_shop_database[index]
+        number = (entry.get("phone") or "").strip()
+        if not number:
+            messagebox.showinfo("No Number", "This body shop entry does not have a phone number yet.")
+            return
+
+        tel_number = re.sub(r"[^0-9+#*,;]", "", number)
+        if not tel_number:
+            messagebox.showinfo("Invalid Number", "This body shop phone number cannot be used for a call action.")
             return
 
         try:
@@ -4149,10 +5243,568 @@ class ClaimsManagerApp:
         except Exception as exc:
             messagebox.showerror("Email Failed", f"Could not email the assignment sheet:\n{exc}")
 
+    def send_review_email_for_selected_claim(self) -> None:
+        if not self.selected_key:
+            messagebox.showinfo("No Claim Selected", "Select a claim first.")
+            return
+        record = self.store.get_claim(self.selected_key)
+        if not record:
+            return
+
+        def get_saved_notes_text() -> str:
+            return (record.notes or "").strip()
+
+        questions_text = self._prompt_text(
+            "Review Questions",
+            "Enter only the actual review questions, one per line.\nUse Shift+Enter for a new line and Enter to continue.\n\nExample:\n1. First question\n2. Second question\n3. Third question\n\nInsurance company and shop name are handled separately in the next step.",
+            "1. ",
+            extra_button_label="Paste Saved Notes",
+            extra_button_handler=get_saved_notes_text,
+        )
+        if questions_text is None:
+            return
+
+        custom_questions: list[str] = []
+        for line in questions_text.splitlines():
+            cleaned = line.strip()
+            if not cleaned:
+                continue
+            cleaned = re.sub(r"^\d+\.\s*", "", cleaned)
+            cleaned = cleaned.lstrip("-").strip()
+            if cleaned:
+                custom_questions.append(cleaned)
+        wizard_questions: list[dict[str, object]] = [
+            {
+                "key": "insurance_company",
+                "label": "Insurance Company",
+                "default": record.insurance_company or "",
+                "input_type": "text",
+            },
+            {
+                "key": "shop_name",
+                "label": "Shop Name",
+                "default": record.shop_name or "",
+                "input_type": "text",
+            },
+        ]
+        for index, question in enumerate(custom_questions, start=1):
+            wizard_questions.append(
+                {
+                    "key": f"custom_{index}",
+                    "label": question,
+                    "default": "",
+                    "input_type": "text",
+                }
+            )
+
+        answers = self._prompt_wizard("Review Email", wizard_questions)
+        if answers is None:
+            return
+
+        attachment_candidates = self._claim_folder_file_candidates(record)
+
+        selected_attachments: list[Path] = []
+        if attachment_candidates:
+            picked = self._prompt_file_attachments("Review Email Attachments", attachment_candidates)
+            if picked is None:
+                return
+            selected_attachments = picked
+
+        insurance_value = (answers.get("insurance_company") or "").strip()
+        shop_value = (answers.get("shop_name") or "").strip()
+        sender_email, app_password = self._get_office_update_email_credentials()
+        if not sender_email or not app_password:
+            messagebox.showerror("Email Failed", "A Gmail address and app password are required to send the review email.")
+            return
+
+        subject_parts = [part for part in (record.claim_id, record.customer_name or record.title) if part]
+        subject = "Review"
+        if subject_parts:
+            subject = f"Review - {' - '.join(subject_parts)}"
+
+        body_lines = [
+            "Hi Joe,",
+            "",
+            "Here is the review information:",
+            "",
+            f"Claim ID: {record.claim_id or '-'}",
+            f"Customer: {record.customer_name or record.title or '-'}",
+            f"Claim #: {record.claim_number or '-'}",
+            f"Insurance Company: {insurance_value or '-'}",
+            f"Shop Name: {shop_value or '-'}",
+        ]
+        body_lines.append("")
+        if custom_questions:
+            body_lines.append("Questions:")
+            body_lines.append("")
+            for index, question in enumerate(custom_questions, start=1):
+                answer = (answers.get(f"custom_{index}") or "").strip() or "-"
+                body_lines.append(f"{index}. {question}")
+                body_lines.append(f"   {answer}")
+                body_lines.append("")
+        else:
+            body_lines.append("No additional questions were entered.")
+            body_lines.append("")
+        body_lines.append("Thank you,")
+        body_lines.append(sender_email)
+
+        message = EmailMessage()
+        message["From"] = sender_email
+        message["To"] = "joe@lasalallc.com"
+        message["Subject"] = subject
+        message.set_content("\n".join(body_lines).strip())
+        for attachment_path in selected_attachments:
+            try:
+                message.add_attachment(
+                    attachment_path.read_bytes(),
+                    maintype="application",
+                    subtype="octet-stream",
+                    filename=attachment_path.name,
+                )
+            except OSError:
+                continue
+
+        try:
+            context = ssl.create_default_context()
+            with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
+                smtp.ehlo()
+                smtp.starttls(context=context)
+                smtp.ehlo()
+                smtp.login(sender_email, app_password)
+                smtp.send_message(message)
+            messagebox.showinfo("Review Email Sent", "The review email was sent to Joe.")
+        except Exception as exc:
+            messagebox.showerror("Email Failed", f"Could not send the review email:\n{exc}")
+
+    def send_rmc_email_for_selected_claim(self) -> None:
+        if not self.selected_key:
+            messagebox.showinfo("No Claim Selected", "Select a claim first.")
+            return
+        record = self.store.get_claim(self.selected_key)
+        if not record:
+            return
+
+        wizard_questions: list[dict[str, object]] = [
+            {
+                "key": "customer_name",
+                "label": "Name of Customer",
+                "default": record.customer_name or "",
+                "input_type": "text",
+            },
+            {
+                "key": "vehicle",
+                "label": "Year Make and Model",
+                "default": record.vehicle or "",
+                "input_type": "text",
+            },
+            {
+                "key": "paint_code",
+                "label": "Paint Code",
+                "default": "",
+                "input_type": "text",
+            },
+            {
+                "key": "paint_hours",
+                "label": "Paint Hrs",
+                "default": "",
+                "input_type": "text",
+            },
+        ]
+        answers = self._prompt_wizard("RMC Email", wizard_questions)
+        if answers is None:
+            return
+
+        sender_email, app_password = self._get_office_update_email_credentials()
+        if not sender_email or not app_password:
+            messagebox.showerror("Email Failed", "A Gmail address and app password are required to send the RMC email.")
+            return
+
+        customer_name_value = (answers.get("customer_name") or "").strip() or "-"
+        vehicle_value = (answers.get("vehicle") or "").strip() or "-"
+        paint_code_value = (answers.get("paint_code") or "").strip() or "-"
+        paint_hours_value = (answers.get("paint_hours") or "").strip() or "-"
+
+        subject = "Need RMC please"
+
+        body_lines = [
+            "Hi Gina,",
+            "",
+            f"Name of Customer: {customer_name_value}",
+            f"Year Make and Model: {vehicle_value}",
+            f"Paint Code: {paint_code_value}",
+            f"Paint Hrs: {paint_hours_value}",
+        ]
+
+        message = EmailMessage()
+        message["From"] = sender_email
+        message["To"] = OFFICE_RMC_EMAIL_TO
+        message["Subject"] = subject
+        message.set_content("\n".join(body_lines))
+
+        try:
+            context = ssl.create_default_context()
+            with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
+                smtp.ehlo()
+                smtp.starttls(context=context)
+                smtp.ehlo()
+                smtp.login(sender_email, app_password)
+                smtp.send_message(message)
+            messagebox.showinfo("RMC Email Sent", f"The RMC email was sent to {OFFICE_RMC_EMAIL_TO}.")
+        except Exception as exc:
+            messagebox.showerror("Email Failed", f"Could not send the RMC email:\n{exc}")
+
+    def send_prelim_email_for_selected_claim(self) -> None:
+        if not self.selected_key:
+            messagebox.showinfo("No Claim Selected", "Select a claim first.")
+            return
+        record = self.store.get_claim(self.selected_key)
+        if not record:
+            return
+
+        pdf_candidates = self._claim_folder_prelim_candidates(record)
+        if not pdf_candidates:
+            messagebox.showinfo("No Prelim PDF", "Could not find any PDF files in this claim folder.")
+            return
+
+        selected_attachments: list[Path] = []
+        if len(pdf_candidates) == 1:
+            selected_attachments = pdf_candidates
+        else:
+            picked = self._prompt_file_attachments("Select Prelim PDF", pdf_candidates)
+            if picked is None:
+                return
+            selected_attachments = picked
+        if not selected_attachments:
+            messagebox.showinfo("No Prelim Selected", "Select at least one prelim PDF first.")
+            return
+
+        wizard_questions: list[dict[str, object]] = [
+            {
+                "key": "shop_name",
+                "label": f"Shop Name ({record.shop_name or 'current value'})",
+                "default": record.shop_name or "",
+                "input_type": "text",
+            },
+            {
+                "key": "shop_email",
+                "label": f"Shop Email ({record.shop_name or 'shop'})",
+                "default": record.shop_email or "",
+                "input_type": "text",
+            },
+            {
+                "key": "leave_message",
+                "label": "Do you want to leave a message as well?",
+                "default": "No",
+                "input_type": "choice",
+                "choices": ["No", "Yes"],
+            },
+            {
+                "key": "message_text",
+                "label": "Message",
+                "default": "",
+                "input_type": "text",
+            },
+        ]
+        answers = self._prompt_wizard("Send Prelim", wizard_questions)
+        if answers is None:
+            return
+
+        original_shop_name = (record.shop_name or "").strip()
+        shop_name = (answers.get("shop_name") or "").strip()
+        shop_email = (answers.get("shop_email") or "").strip()
+        leave_message = (answers.get("leave_message") or "").strip().lower() == "yes"
+        message_text = (answers.get("message_text") or "").strip()
+        if not shop_name:
+            shop_name = original_shop_name
+
+        if not shop_email:
+            messagebox.showinfo("Shop Email Required", "Enter the shop email address first.")
+            return
+
+        # Save the shop info first so the database stays updated even if the
+        # send succeeds but the UI refresh lags or the claim view changes.
+        self._update_shop_contact_info(record, shop_name, shop_email, original_shop_name=original_shop_name)
+
+        if leave_message and message_text:
+            body = f"{message_text}\n\nthank you!\nfernando"
+        else:
+            body = "thank you!\nfernando"
+
+        sender_email, app_password = self._get_office_update_email_credentials()
+        if not sender_email or not app_password:
+            messagebox.showerror("Email Failed", "A Gmail address and app password are required to send the prelim email.")
+            return
+
+        message = EmailMessage()
+        message["From"] = sender_email
+        message["To"] = shop_email
+        message["Subject"] = "please review and advise"
+        message.set_content(body)
+        for attachment_path in selected_attachments:
+            try:
+                message.add_attachment(
+                    attachment_path.read_bytes(),
+                    maintype="application",
+                    subtype="pdf",
+                    filename=attachment_path.name,
+                )
+            except OSError:
+                continue
+
+        try:
+            context = ssl.create_default_context()
+            with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
+                smtp.ehlo()
+                smtp.starttls(context=context)
+                smtp.ehlo()
+                smtp.login(sender_email, app_password)
+                smtp.send_message(message)
+            messagebox.showinfo("Prelim Email Sent", "The prelim email was sent to the shop.")
+        except Exception as exc:
+            messagebox.showerror("Email Failed", f"Could not send the prelim email:\n{exc}")
+
+    def _claim_folder_prelim_candidates(self, record: ClaimRecord) -> list[Path]:
+        candidates = self._claim_folder_file_candidates(record)
+        pdfs = [path for path in candidates if path.suffix.lower() == ".pdf"]
+        prelims = [path for path in pdfs if "prelim" in path.name.lower()]
+        return prelims or pdfs
+
+    def _update_shop_contact_info(
+        self,
+        record: ClaimRecord,
+        shop_name: str,
+        shop_email: str,
+        original_shop_name: str = "",
+    ) -> None:
+        target_shop_name = (shop_name or original_shop_name or record.shop_name or "").strip()
+        updated = False
+        if target_shop_name and target_shop_name != record.shop_name:
+            record.shop_name = target_shop_name
+            updated = True
+        if shop_email and shop_email != record.shop_email:
+            record.shop_email = shop_email
+            updated = True
+        if updated:
+            self.store.save_claim_state(record)
+            self.store.upsert_claim(record)
+
+        if not target_shop_name:
+            self.refresh_views(select_key=record.key)
+            return
+        entry = self._find_body_shop_entry(target_shop_name)
+        if entry is None and original_shop_name and original_shop_name != target_shop_name:
+            entry = self._find_body_shop_entry(original_shop_name)
+        if entry is None:
+            self.store.body_shop_database.append(
+                {
+                    "shop_name": target_shop_name,
+                    "contact_name": "",
+                    "phone": "",
+                    "email": shop_email,
+                    "address": "",
+                    "body_rate": "",
+                    "paint_rate": "",
+                    "frame_rate": "",
+                    "mechanical_rate": "",
+                    "certifications": "",
+                    "negotiation_notes": "",
+                    "notes": "",
+                }
+            )
+        else:
+            entry["shop_name"] = target_shop_name
+            if shop_email:
+                entry["email"] = shop_email
+        self.store.save()
+        self.refresh_body_shops_view()
+        self.refresh_views(select_key=record.key)
+
+    def _claim_folder_file_candidates(self, record: ClaimRecord) -> list[Path]:
+        attachment_candidates: list[Path] = []
+        if record.source_path and record.source_path != "Manual Entry":
+            claim_folder = Path(record.source_path)
+            if claim_folder.exists() and claim_folder.is_dir():
+                for child in sorted(claim_folder.iterdir(), key=lambda item: item.name.lower()):
+                    if not child.is_file():
+                        continue
+                    if child.name.lower() in {"desktop.ini", "thumbs.db"}:
+                        continue
+                    attachment_candidates.append(child)
+        return attachment_candidates
+
+    def _open_outlook_draft(self, to_address: str, subject: str, body: str, attachments: list[Path]) -> None:
+        escaped_to = to_address.replace("'", "''")
+        escaped_subject = subject.replace("'", "''")
+        escaped_body = body.replace("'", "''")
+        escaped_attachments = ["'" + str(path).replace("'", "''") + "'" for path in attachments]
+        attachment_values = ", ".join(escaped_attachments)
+        script = f"""
+$outlook = New-Object -ComObject Outlook.Application
+$mail = $outlook.CreateItem(0)
+$mail.To = '{escaped_to}'
+$mail.Subject = '{escaped_subject}'
+$mail.Body = '{escaped_body}'
+foreach ($attachment in @({attachment_values})) {{
+    if ($attachment) {{
+        $mail.Attachments.Add($attachment) | Out-Null
+    }}
+}}
+$mail.Display()
+"""
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    def open_shop_email_draft_for_selected_claim(self) -> None:
+        if not self.selected_key:
+            messagebox.showinfo("No Claim Selected", "Select a claim first.")
+            return
+        record = self.store.get_claim(self.selected_key)
+        if not record:
+            return
+
+        initial_email = record.shop_email or ""
+        shop_email = simpledialog.askstring(
+            "Shop Email",
+            "Enter the shop email address for this draft:",
+            initialvalue=initial_email,
+            parent=self.root,
+        )
+        if shop_email is None:
+            return
+        shop_email = shop_email.strip()
+        if not shop_email:
+            messagebox.showinfo("Shop Email Required", "Enter a shop email address first.")
+            return
+
+        attachment_candidates = self._claim_folder_file_candidates(record)
+        selected_attachments: list[Path] = []
+        if attachment_candidates:
+            picked = self._prompt_file_attachments("Shop Email Attachments", attachment_candidates)
+            if picked is None:
+                return
+            selected_attachments = picked
+
+        subject_parts = [part for part in (record.claim_id, record.customer_name or record.title) if part]
+        subject = "Claim Copy"
+        if subject_parts:
+            subject = f"Claim Copy - {' - '.join(subject_parts)}"
+        body_lines = [
+            "Hi,",
+            "",
+            "Attached are the selected claim files.",
+            "",
+            f"Claim ID: {record.claim_id or '-'}",
+            f"Customer: {record.customer_name or record.title or '-'}",
+            f"Claim #: {record.claim_number or '-'}",
+            f"Insurance Company: {record.insurance_company or '-'}",
+            f"Shop Name: {record.shop_name or '-'}",
+            "",
+            "Thank you,",
+        ]
+        sender_email = (self.store.email_settings.get("office_update_from") or OFFICE_UPDATE_EMAIL_FROM).strip()
+        if sender_email:
+            body_lines.append(sender_email)
+        body = "\n".join(body_lines).strip()
+
+        try:
+            self._open_outlook_draft(shop_email, subject, body, selected_attachments)
+            messagebox.showinfo("Draft Ready", "A new email draft was opened for the shop.")
+        except Exception as exc:
+            messagebox.showerror(
+                "Draft Failed",
+                f"Could not open the shop email draft.\n\nThis feature depends on Outlook desktop being available.\n\n{exc}",
+            )
+
     def generate_nada_pdf_for_selected_claim(self) -> None:
         webbrowser.open("https://www.jdpower.com/cars/manufacturers")
 
-    def _prompt_text(self, title: str, prompt: str, initialvalue: str = "") -> str | None:
+    def _prompt_file_attachments(self, title: str, files: list[Path]) -> list[Path] | None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.resizable(True, True)
+        dialog.geometry("620x420")
+        dialog.grab_set()
+
+        result: dict[str, list[Path] | None] = {"value": None}
+        variables: list[tuple[Path, tk.BooleanVar]] = []
+
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            frame,
+            text="Select the files you want attached to the email.",
+            wraplength=580,
+            justify="left",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        list_frame = ttk.Frame(frame)
+        list_frame.grid(row=1, column=0, sticky="nsew")
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(list_frame, highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        inner = ttk.Frame(canvas)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def sync_scroll(_event: object | None = None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def resize_inner(event: object) -> None:
+            canvas.itemconfigure(window, width=getattr(event, "width", 0))
+
+        inner.bind("<Configure>", sync_scroll)
+        canvas.bind("<Configure>", resize_inner)
+
+        for index, file_path in enumerate(files):
+            checked = tk.BooleanVar(value=False)
+            variables.append((file_path, checked))
+            ttk.Checkbutton(inner, text=file_path.name, variable=checked).grid(row=index, column=0, sticky="w", pady=2)
+
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=2, column=0, sticky="e", pady=(10, 0))
+
+        def submit() -> None:
+            result["value"] = [path for path, variable in variables if variable.get()]
+            self._remember_dialog_geometry(dialog)
+            dialog.destroy()
+
+        def cancel() -> None:
+            result["value"] = None
+            self._remember_dialog_geometry(dialog)
+            dialog.destroy()
+
+        ttk.Button(button_row, text="OK", command=submit).pack(side="left", padx=(0, 8))
+        ttk.Button(button_row, text="Cancel", command=cancel).pack(side="left")
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.bind("<Escape>", lambda _event: cancel())
+        dialog.update_idletasks()
+        self._place_dialog(dialog)
+        self.root.wait_window(dialog)
+        return result["value"]
+
+    def _prompt_text(
+        self,
+        title: str,
+        prompt: str,
+        initialvalue: str = "",
+        extra_button_label: str = "",
+        extra_button_handler: typing.Callable[[], str] | None = None,
+    ) -> str | None:
         dialog = tk.Toplevel(self.root)
         dialog.title(title)
         dialog.transient(self.root)
@@ -4194,7 +5846,24 @@ class ClaimsManagerApp:
             text.insert(tk.INSERT, "\n")
             return "break"
 
+        def run_extra_action() -> None:
+            if not extra_button_handler:
+                return
+            extra_text = (extra_button_handler() or "").strip()
+            if not extra_text:
+                return
+            current = text.get("1.0", tk.END).strip()
+            if current:
+                if not current.endswith("\n"):
+                    text.insert(tk.END, "\n")
+                text.insert(tk.END, extra_text)
+            else:
+                text.insert("1.0", extra_text)
+            text.focus_set()
+
         ttk.Button(button_row, text="OK", command=submit).pack(side="left", padx=(0, 8))
+        if extra_button_label and extra_button_handler:
+            ttk.Button(button_row, text=extra_button_label, command=run_extra_action).pack(side="left", padx=(0, 8))
         ttk.Button(button_row, text="Cancel", command=cancel).pack(side="left")
 
         dialog.protocol("WM_DELETE_WINDOW", cancel)
@@ -4272,11 +5941,19 @@ class ClaimsManagerApp:
         dialog.update_idletasks()
         width = dialog.winfo_width()
         height = dialog.winfo_height()
+        screen_width = dialog.winfo_screenwidth()
+        screen_height = dialog.winfo_screenheight()
         if self.last_dialog_geometry:
             _last_width, _last_height, x, y = self.last_dialog_geometry
+            x = max(0, min(x, max(screen_width - width, 0)))
+            y = max(0, min(y, max(screen_height - height, 0)))
             dialog.geometry(f"{width}x{height}+{x}+{y}")
+            dialog.lift()
+            dialog.focus_force()
             return
         self._center_dialog(dialog)
+        dialog.lift()
+        dialog.focus_force()
 
     def _remember_dialog_geometry(self, dialog: tk.Toplevel) -> None:
         dialog.update_idletasks()
@@ -5331,6 +7008,17 @@ class ClaimsManagerApp:
             self.clear_details()
             return
 
+        matched_shop = self._find_body_shop_entry(record.shop_name)
+        matched_shop_contact = (matched_shop.get("contact_name") or "").strip() if matched_shop else ""
+        matched_shop_phone = (matched_shop.get("phone") or "").strip() if matched_shop else ""
+        matched_shop_email = (matched_shop.get("email") or "").strip() if matched_shop else ""
+        matched_body_rate = (matched_shop.get("body_rate") or "").strip() if matched_shop else ""
+        matched_paint_rate = (matched_shop.get("paint_rate") or "").strip() if matched_shop else ""
+        matched_frame_rate = (matched_shop.get("frame_rate") or "").strip() if matched_shop else ""
+        matched_mechanical_rate = (matched_shop.get("mechanical_rate") or "").strip() if matched_shop else ""
+        matched_certifications = (matched_shop.get("certifications") or "").strip() if matched_shop else ""
+        matched_negotiation_notes = (matched_shop.get("negotiation_notes") or "").strip() if matched_shop else ""
+
         self.detail_vars["claim_id"].set(record.claim_id)
         self.detail_vars["title"].set(record.title)
         self.detail_vars["status"].set(record.status)
@@ -5353,6 +7041,15 @@ class ClaimsManagerApp:
         self.detail_vars["facts_of_loss"].set(record.facts_of_loss)
         self.detail_vars["total_loss"].set("Yes" if record.total_loss else "No")
         self.detail_vars["shop_name"].set(record.shop_name)
+        self.detail_vars["shop_contact_name"].set(matched_shop_contact)
+        self.detail_vars["shop_phone"].set(record.shop_phone or matched_shop_phone)
+        self.detail_vars["shop_email"].set(record.shop_email or matched_shop_email)
+        self.detail_vars["shop_body_rate"].set(matched_body_rate)
+        self.detail_vars["shop_paint_rate"].set(matched_paint_rate)
+        self.detail_vars["shop_frame_rate"].set(matched_frame_rate)
+        self.detail_vars["shop_mechanical_rate"].set(matched_mechanical_rate)
+        self.detail_vars["shop_certifications"].set(matched_certifications)
+        self.detail_vars["shop_negotiation_notes"].set(matched_negotiation_notes)
         self.detail_vars["contact_phone"].set(record.contact_phone)
         self.detail_vars["contact_email"].set(record.contact_email)
         self.detail_vars["assignment_claim_notes"].set(record.assignment_claim_notes)
@@ -5400,6 +7097,7 @@ class ClaimsManagerApp:
 
         record.manual_overrides = manual_overrides
         record.updated_at = now_stamp()
+        self.store.save_claim_state(record)
         self.store.upsert_claim(record)
         self.store.save()
         self.refresh_views(select_key=record.key)
@@ -5419,6 +7117,7 @@ class ClaimsManagerApp:
         record.note_history.append({"timestamp": now_stamp(), "text": note_text})
         record.notes = render_note_history(record.note_history)
         record.updated_at = now_stamp()
+        self.store.save_claim_state(record)
         self.store.upsert_claim(record)
         self.store.save()
         self.refresh_views(select_key=record.key)
@@ -5445,6 +7144,7 @@ class ClaimsManagerApp:
             record.note_history.append({"timestamp": now_stamp(), "text": note_text})
             record.notes = render_note_history(record.note_history)
         record.updated_at = now_stamp()
+        self.store.save_claim_state(record)
         self.store.upsert_claim(record)
         self.store.save()
         self.scan_folders()
@@ -5500,6 +7200,7 @@ class ClaimsManagerApp:
                 contact_email=record.contact_email,
                 assign_pdf_path=record.assign_pdf_path,
             )
+            self.store.save_claim_state(new_record)
             self.store.upsert_claim(new_record)
             self.store.save()
             self.scan_folders()
@@ -5512,6 +7213,7 @@ class ClaimsManagerApp:
         record.claim_id = self._extract_job_number(record.title) or record.claim_id
         record.status = "Open"
         record.updated_at = now_stamp()
+        self.store.save_claim_state(record)
         self.store.upsert_claim(record)
         self.store.save()
         self.scan_folders()
@@ -5662,21 +7364,73 @@ class ClaimsManagerApp:
         payload_path.write_text(json.dumps(payload), encoding="utf-8")
 
         script = r"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$word = $null
+$doc = $null
+function Set-MitchellFieldResult($field, [string]$value) {
+    if ($null -eq $value) {
+        $candidate = ""
+    }
+    else {
+        $candidate = [string]$value
+    }
+    try {
+        $field.Result = $candidate
+        return
+    }
+    catch {
+        if ($_.Exception.Message -notlike '*String too long*') {
+            throw
+        }
+    }
+
+    $low = 0
+    $high = [Math]::Min(255, $candidate.Length)
+    while ($low -lt $high) {
+        $mid = [int][Math]::Floor(($low + $high + 1) / 2)
+        if ($mid -lt $candidate.Length -and $mid -gt 3) {
+            $trial = $candidate.Substring(0, $mid - 3) + '...'
+        }
+        else {
+            $trial = $candidate.Substring(0, $mid)
+        }
+        try {
+            $field.Result = $trial
+            $low = $mid
+        }
+        catch {
+            if ($_.Exception.Message -like '*String too long*') {
+                $high = $mid - 1
+            }
+            else {
+                throw
+            }
+        }
+    }
+
+    if ($low -lt $candidate.Length -and $low -gt 3) {
+        $field.Result = $candidate.Substring(0, $low - 3) + '...'
+    }
+    else {
+        $field.Result = $candidate.Substring(0, $low)
+    }
+}
 $payload = Get-Content -Raw '__PAYLOAD__' | ConvertFrom-Json
-$word = New-Object -ComObject Word.Application
-$word.Visible = $false
-$word.DisplayAlerts = 0
-$word.ScreenUpdating = $false
-$word.Options.SaveNormalPrompt = $false
-$word.Options.ConfirmConversions = $false
-$word.Options.WarnBeforeSavingPrintingSendingMarkup = $false
-$word.AutomationSecurity = 3
-$doc = $word.Documents.Open($payload.template_path)
 try {
+    $word = New-Object -ComObject Word.Application
+    $word.Visible = $false
+    $word.DisplayAlerts = 0
+    $word.ScreenUpdating = $false
+    $word.Options.SaveNormalPrompt = $false
+    $word.Options.ConfirmConversions = $false
+    $word.Options.WarnBeforeSavingPrintingSendingMarkup = $false
+    $word.AutomationSecurity = 3
+    $doc = $word.Documents.Open($payload.template_path)
     foreach ($field in $doc.FormFields) {
         $name = [string]$field.Name
         if ($payload.text_fields.PSObject.Properties.Name -contains $name) {
-            $field.Result = [string]$payload.text_fields.$name
+            Set-MitchellFieldResult $field ([string]$payload.text_fields.$name)
         }
     }
     for ($i = 0; $i -lt $doc.FormFields.Count; $i++) {
@@ -5693,16 +7447,30 @@ finally {
 }
 """
         script = script.replace("__PAYLOAD__", str(payload_path))
+        self._run_word_automation_script(script, "filling the Mitchell template")
+
+    def _run_word_automation_script(self, script: str, action: str, timeout: int = 90) -> None:
+        encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
         try:
             subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=90,
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Sta", "-EncodedCommand", encoded_script],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
             )
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("Word timed out while filling the Mitchell template. Close any open Word windows and try again.") from exc
+            raise RuntimeError(f"Word timed out while {action}. Close any open Word windows and try again.") from exc
+        except subprocess.CalledProcessError as exc:
+            details = (exc.stderr or exc.stdout or "").strip().replace("\r", "")
+            if "0x80070520" in details or "specified logon session does not exist" in details.lower():
+                raise RuntimeError(
+                    "Word automation could not start. Open Microsoft Word on the desktop, then try again.\n\n"
+                    f"{details}"
+                ) from exc
+            if details:
+                raise RuntimeError(f"Word failed while {action}:\n{details}") from exc
+            raise RuntimeError(f"Word failed while {action} with exit code {exc.returncode}.") from exc
 
     def _apply_choice_to_checkbox_indices(
         self,
@@ -5723,34 +7491,31 @@ finally {
             checkbox_values[field_number - 1] = idx == selected_idx
 
     def _export_doc_to_pdf(self, doc_path: Path, pdf_path: Path) -> None:
+        doc_literal = str(doc_path).replace("'", "''")
+        pdf_literal = str(pdf_path).replace("'", "''")
         script = rf"""
-$word = New-Object -ComObject Word.Application
-$word.Visible = $false
-$word.DisplayAlerts = 0
-$word.ScreenUpdating = $false
-$word.Options.SaveNormalPrompt = $false
-$word.Options.ConfirmConversions = $false
-$word.Options.WarnBeforeSavingPrintingSendingMarkup = $false
-$word.AutomationSecurity = 3
-$doc = $word.Documents.Open('{doc_path}')
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$word = $null
+$doc = $null
 try {{
-    $doc.ExportAsFixedFormat('{pdf_path}', 17)
+    $word = New-Object -ComObject Word.Application
+    $word.Visible = $false
+    $word.DisplayAlerts = 0
+    $word.ScreenUpdating = $false
+    $word.Options.SaveNormalPrompt = $false
+    $word.Options.ConfirmConversions = $false
+    $word.Options.WarnBeforeSavingPrintingSendingMarkup = $false
+    $word.AutomationSecurity = 3
+    $doc = $word.Documents.Open('{doc_literal}')
+    $doc.ExportAsFixedFormat('{pdf_literal}', 17)
 }}
 finally {{
     if ($null -ne $doc) {{ $doc.Close($false) }}
     if ($null -ne $word) {{ $word.Quit() }}
 }}
 """
-        try:
-            subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=90,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("Word timed out while exporting the Mitchell PDF. Close any open Word windows and try again.") from exc
+        self._run_word_automation_script(script, "exporting the Mitchell PDF")
 
     def _unique_destination(self, destination: Path) -> Path:
         if not destination.exists():
@@ -5763,10 +7528,237 @@ finally {{
             counter += 1
 
 
+class StartupSplash:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.window = tk.Toplevel(root)
+        self.window.title(APP_DISPLAY_NAME)
+        self.window.overrideredirect(True)
+        self.window.configure(bg="#0b1524")
+        self.window.attributes("-topmost", True)
+
+        shell = tk.Frame(self.window, bg="#0b1524", bd=0, highlightthickness=0)
+        shell.pack(fill="both", expand=True)
+
+        card = tk.Frame(shell, bg="#101d33", bd=0, highlightbackground="#315f8f", highlightthickness=1)
+        card.pack(fill="both", expand=True, padx=18, pady=18)
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_columnconfigure(1, minsize=220)
+
+        tk.Frame(card, bg="#68c9ff", height=7).grid(row=0, column=0, columnspan=2, sticky="ew")
+
+        tk.Label(
+            card,
+            text="FIELD OPERATIONS SUITE",
+            font=("Segoe UI", 9, "bold"),
+            fg="#61c2ff",
+            bg="#101d33",
+        ).grid(row=1, column=0, sticky="w", padx=30, pady=(24, 4))
+
+        tk.Label(
+            card,
+            text=APP_DISPLAY_NAME,
+            font=("Segoe UI", 30, "bold"),
+            fg="#f5f7fb",
+            bg="#101d33",
+        ).grid(row=2, column=0, sticky="w", padx=30)
+
+        tk.Label(
+            card,
+            text="Claims intake, tracking, reporting, and field workflow",
+            font=("Segoe UI", 11),
+            fg="#bfd2e8",
+            bg="#101d33",
+        ).grid(row=3, column=0, sticky="w", padx=30, pady=(8, 0))
+
+        tk.Label(
+            card,
+            text=f"Owned and built by {APP_OWNER_NAME}",
+            font=("Segoe UI", 10, "bold"),
+            fg="#82d2ff",
+            bg="#101d33",
+        ).grid(row=4, column=0, sticky="w", padx=30, pady=(14, 20))
+
+        hero_panel = tk.Frame(card, bg="#152a45", bd=0, highlightbackground="#3b6b99", highlightthickness=1)
+        hero_panel.grid(row=1, column=1, rowspan=4, sticky="nsew", padx=(0, 24), pady=(24, 18))
+        tk.Label(
+            hero_panel,
+            text="2.0",
+            font=("Segoe UI", 44, "bold"),
+            fg="#f5fbff",
+            bg="#152a45",
+        ).pack(anchor="w", padx=18, pady=(16, 0))
+        tk.Label(
+            hero_panel,
+            text="Desktop command center for claims,\nforms, notes, routing, and shop tools.",
+            font=("Segoe UI", 10),
+            fg="#c7dbef",
+            bg="#152a45",
+            justify="left",
+        ).pack(anchor="w", padx=18, pady=(2, 0))
+        tk.Label(
+            hero_panel,
+            text="PRIVATE BUILD",
+            font=("Segoe UI", 8, "bold"),
+            fg="#89d3ff",
+            bg="#1b3657",
+            padx=10,
+            pady=5,
+        ).pack(anchor="w", padx=18, pady=(18, 0))
+
+        info_row = tk.Frame(card, bg="#101d33")
+        info_row.grid(row=5, column=0, sticky="ew", padx=30, pady=(0, 18))
+        for idx, (label_text, value_text) in enumerate((
+            ("Version", "2.0"),
+            ("Mode", "Desktop"),
+            ("Status", "Secure startup"),
+        )):
+            info_card = tk.Frame(info_row, bg="#18314f", bd=0, highlightbackground="#396796", highlightthickness=1)
+            info_card.grid(row=0, column=idx, sticky="w", padx=(0, 10))
+            tk.Label(
+                info_card,
+                text=label_text,
+                font=("Segoe UI", 8, "bold"),
+                fg="#7dc6f4",
+                bg="#18314f",
+                padx=10,
+                pady=7,
+            ).pack(anchor="w")
+            tk.Label(
+                info_card,
+                text=value_text,
+                font=("Segoe UI", 9),
+                fg="#eef5ff",
+                bg="#18314f",
+                padx=10,
+                pady=2,
+            ).pack(anchor="w", pady=(0, 6))
+
+        badge_row = tk.Frame(card, bg="#101d33")
+        badge_row.grid(row=6, column=0, columnspan=2, sticky="ew", padx=30)
+        for idx, badge in enumerate(("Open Claims", "Office Updates", "Route Planner", "Claim Tools")):
+            label = tk.Label(
+                badge_row,
+                text=badge,
+                font=("Segoe UI", 9, "bold"),
+                fg="#dce8f8",
+                bg="#1d3958",
+                padx=12,
+                pady=7,
+            )
+            label.grid(row=0, column=idx, padx=(0, 10), sticky="w")
+
+        self.status_var = tk.StringVar(value="Preparing workspace...")
+        self.percent_var = tk.StringVar(value="0%")
+        tk.Label(
+            card,
+            textvariable=self.status_var,
+            font=("Segoe UI", 10),
+            fg="#dce8f8",
+            bg="#101d33",
+        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=30, pady=(28, 10))
+
+        progress_row = tk.Frame(card, bg="#101d33")
+        progress_row.grid(row=8, column=0, columnspan=2, sticky="ew", padx=30)
+        progress_row.grid_columnconfigure(0, weight=1)
+
+        progress_shell = tk.Frame(progress_row, bg="#203754", height=16)
+        progress_shell.grid(row=0, column=0, sticky="ew")
+        progress_shell.grid_propagate(False)
+        progress_shell.grid_columnconfigure(0, weight=1)
+
+        self.progress_value = tk.DoubleVar(value=0.0)
+        self.progress = ttk.Progressbar(
+            progress_shell,
+            variable=self.progress_value,
+            maximum=100,
+            mode="determinate",
+            style="Splash.Horizontal.TProgressbar",
+        )
+        self.progress.grid(row=0, column=0, sticky="ew")
+
+        tk.Label(
+            progress_row,
+            textvariable=self.percent_var,
+            font=("Segoe UI", 9, "bold"),
+            fg="#8fd0ff",
+            bg="#101d33",
+            width=5,
+            anchor="e",
+        ).grid(row=0, column=1, sticky="e", padx=(12, 0))
+
+        tk.Label(
+            card,
+            text="Initializing local data, forms, shop tools, and claim views...",
+            font=("Segoe UI", 9),
+            fg="#90a7c6",
+            bg="#101d33",
+        ).grid(row=9, column=0, columnspan=2, sticky="w", padx=30, pady=(10, 26))
+
+        self.window.update_idletasks()
+        self._center()
+
+    def _center(self) -> None:
+        width = 860
+        height = 390
+        screen_width = self.window.winfo_screenwidth()
+        screen_height = self.window.winfo_screenheight()
+        x_pos = max((screen_width - width) // 2, 0)
+        y_pos = max((screen_height - height) // 2, 0)
+        self.window.geometry(f"{width}x{height}+{x_pos}+{y_pos}")
+
+    def set_progress(self, percent: float, message: str) -> None:
+        self.progress_value.set(max(0.0, min(100.0, percent)))
+        self.percent_var.set(f"{int(max(0.0, min(100.0, percent)))}%")
+        self.status_var.set(message)
+        self.window.update_idletasks()
+
+    def close(self) -> None:
+        try:
+            self.window.destroy()
+        except tk.TclError:
+            pass
+
+
 def main() -> None:
     root = tk.Tk()
-    ttk.Style().theme_use("clam")
-    ClaimsManagerApp(root)
+    root.withdraw()
+    style = ttk.Style()
+    style.theme_use("clam")
+    style.configure(
+        "Splash.Horizontal.TProgressbar",
+        troughcolor="#203754",
+        background="#59b8ff",
+        bordercolor="#203754",
+        lightcolor="#59b8ff",
+        darkcolor="#59b8ff",
+        thickness=16,
+    )
+
+    splash = StartupSplash(root)
+    steps = [
+        (12, "Loading claims workspace..."),
+        (32, "Checking watched folders..."),
+        (54, "Preparing forms and templates..."),
+        (76, "Loading reports and office views..."),
+        (92, "Finalizing dashboard..."),
+        (100, "Ready."),
+    ]
+
+    def run_step(index: int = 0) -> None:
+        if index < len(steps):
+            percent, message = steps[index]
+            splash.set_progress(percent, message)
+            root.after(850, lambda: run_step(index + 1))
+            return
+
+        ClaimsManagerApp(root)
+        splash.close()
+        root.deiconify()
+        root.lift()
+        root.focus_force()
+
+    root.after(100, run_step)
     root.mainloop()
 
 

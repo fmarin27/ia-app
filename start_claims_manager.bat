@@ -1,3 +1,3 @@
 @echo off
 cd /d "%~dp0"
-python claims_manager.py
+"C:\Program Files\Python311\python.exe" "C:\Users\ferna\Desktop\IA APP\claims_manager.py"
