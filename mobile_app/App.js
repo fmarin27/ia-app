@@ -28,7 +28,8 @@ import * as ImageManipulator from "expo-image-manipulator";
 import * as Updates from "expo-updates";
 import appConfig from "./app.json";
 
-const API_BASE_DEFAULT = "https://api.luxuryimportsusa.shop";
+const API_BASE_DEFAULT = "https://api2.luxuryimportsusa.shop";
+const API_BASE_LEGACY = "https://api.luxuryimportsusa.shop";
 const BULLET = " | ";
 const API_BASE_STORAGE_KEY = "claim_manager_mobile_api_base";
 const ROUTE_PLAN_STORAGE_KEY = "claim_manager_mobile_route_plan_keys";
@@ -169,7 +170,12 @@ export default function App() {
       try {
         const saved = (await AsyncStorage.getItem(API_BASE_STORAGE_KEY))?.trim();
         if (!cancelled && saved) {
-          setApiBase(saved);
+          if (saved === API_BASE_LEGACY) {
+            await AsyncStorage.setItem(API_BASE_STORAGE_KEY, API_BASE_DEFAULT);
+            setApiBase(API_BASE_DEFAULT);
+          } else {
+            setApiBase(saved);
+          }
         }
       } catch {}
       if (!cancelled) {
@@ -861,11 +867,11 @@ export default function App() {
                 autoCapitalize="none"
                 autoCorrect={false}
                 style={styles.input}
-                placeholder="https://api.luxuryimportsusa.shop"
-              />
-              <Text style={styles.helper}>
-                Public address: https://api.luxuryimportsusa.shop
-              </Text>
+                placeholder="https://api2.luxuryimportsusa.shop"
+                />
+                <Text style={styles.helper}>
+                  Public address: https://api2.luxuryimportsusa.shop
+                </Text>
               {updateMessage ? <Text style={styles.helper}>{updateMessage}</Text> : null}
             </View>
           </SafeAreaView>

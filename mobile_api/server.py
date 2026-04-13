@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
 import sys
 import threading
 from dataclasses import asdict
@@ -24,7 +25,7 @@ try:
 except Exception:
     PdfReader = None
 HOST = "0.0.0.0"
-PORT = 8011
+PORT = int(os.environ.get("CLAIM_MANAGER_MOBILE_API_PORT", "8011"))
 IGNORED_FILE_NAMES = {"desktop.ini", "thumbs.db"}
 PHOTO_EXTENSIONS = {
     ".jpg": "image/jpeg",
