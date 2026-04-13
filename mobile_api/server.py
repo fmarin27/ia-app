@@ -61,27 +61,25 @@ def clean_text(value: object) -> str:
 
 def normalize_photo_label(value: object) -> str:
     text = clean_text(value).upper()
-    text = re.sub(r"[^A-Z0-9 -]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip(" .-_")
+    text = re.sub(r"[^A-Z0-9]+", "", text)
     return text
 
 
 def next_labeled_photo_path(folder: Path, label: str, suffix: str) -> Path:
     safe_label = normalize_photo_label(label)
     if safe_label:
-        candidate = folder / f"{safe_label}{suffix}"
         counter = 1
+        candidate = folder / f"{safe_label}{counter}{suffix}"
         while candidate.exists():
-            candidate = folder / f"{safe_label}-{counter}{suffix}"
             counter += 1
+            candidate = folder / f"{safe_label}{counter}{suffix}"
         return candidate
 
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    candidate = folder / f"mobile-photo-{timestamp}{suffix}"
-    counter = 2
+    counter = 1
+    candidate = folder / f"PHOTO{counter}{suffix}"
     while candidate.exists():
-        candidate = folder / f"mobile-photo-{timestamp}-{counter}{suffix}"
         counter += 1
+        candidate = folder / f"PHOTO{counter}{suffix}"
     return candidate
 
 
