@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import re
 import sys
 import threading
 from dataclasses import asdict
@@ -56,6 +57,32 @@ def iso_timestamp(path: Path) -> str:
 
 def clean_text(value: object) -> str:
     return str(value or "").strip()
+
+
+def normalize_photo_label(value: object) -> str:
+    text = clean_text(value).upper()
+    text = re.sub(r"[^A-Z0-9 -]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" .-_")
+    return text
+
+
+def next_labeled_photo_path(folder: Path, label: str, suffix: str) -> Path:
+    safe_label = normalize_photo_label(label)
+    if safe_label:
+        candidate = folder / f"{safe_label}{suffix}"
+        counter = 1
+        while candidate.exists():
+            candidate = folder / f"{safe_label}-{counter}{suffix}"
+            counter += 1
+        return candidate
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    candidate = folder / f"mobile-photo-{timestamp}{suffix}"
+    counter = 2
+    while candidate.exists():
+        candidate = folder / f"mobile-photo-{timestamp}-{counter}{suffix}"
+        counter += 1
+    return candidate
 
 
 def parse_multipart_file(body: bytes, content_type: str, field_name: str) -> tuple[str, str, bytes] | None:
@@ -679,6 +706,7 @@ class MobileApiHandler(BaseHTTPRequestHandler):
     def _upload_photo(self, query: str) -> None:
         params = parse_qs(query)
         claim_key = unquote(clean_text(params.get("key", [""])[0]))
+        requested_label = unquote(clean_text(params.get("label", [""])[0]))
         claim = self._find_claim(claim_key)
         if not claim:
             self._send_json({"error": "Claim not found."}, status=404)
@@ -706,12 +734,7 @@ class MobileApiHandler(BaseHTTPRequestHandler):
         original_name, parsed_content_type, file_bytes = parsed_file
         suffix = Path(original_name).suffix.lower() or ".jpg"
         content_type = clean_text(parsed_content_type) or PHOTO_EXTENSIONS.get(suffix, "image/jpeg")
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        destination = folder / f"mobile-photo-{timestamp}{suffix}"
-        counter = 2
-        while destination.exists():
-            destination = folder / f"mobile-photo-{timestamp}-{counter}{suffix}"
-            counter += 1
+        destination = next_labeled_photo_path(folder, requested_label, suffix)
 
         with destination.open("wb") as handle:
             handle.write(file_bytes)
@@ -719,6 +742,7 @@ class MobileApiHandler(BaseHTTPRequestHandler):
         self._send_json(
             {
                 "ok": True,
+                "label": normalize_photo_label(requested_label),
                 "file": self._serialize_file_entry(claim, destination, folder, self._request_base_url(), override_type=content_type),
             }
         )

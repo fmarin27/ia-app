@@ -10,6 +10,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
   ActivityIndicator,
   FlatList,
+  Image,
   Linking,
   Modal,
   Platform,
@@ -58,6 +59,27 @@ const LIBRARY_TABS = [
   ["tools", "Claim Tools"],
   ["shops", "Body Shops"],
   ["insurance", "Insurance"],
+];
+
+const PHOTO_LABEL_OPTIONS = [
+  "VIN",
+  "MILEAGE",
+  "LICENSE PLATE",
+  "INTERIOR",
+  "DASHBOARD",
+  "DOOR TRIM PANEL",
+  "LEFT FRONT",
+  "RIGHT FRONT",
+  "LEFT REAR",
+  "RIGHT REAR",
+  "DAMAGE",
+  "UPD",
+  "TIRE INFO",
+  "INVOICE",
+  "ESTIMATE",
+  "DOP",
+  "REPAIR AUTHORIZATION",
+  "OTHER",
 ];
 
 async function prepareUploadPhoto(asset) {
@@ -136,6 +158,10 @@ export default function App() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [noteSaving, setNoteSaving] = useState(false);
   const [uploadingPhoto, setUploadingPhoto] = useState(false);
+  const [photoSessionVisible, setPhotoSessionVisible] = useState(false);
+  const [pendingPhotoAsset, setPendingPhotoAsset] = useState(null);
+  const [pendingPhotoLabel, setPendingPhotoLabel] = useState("");
+  const [photoSessionUploads, setPhotoSessionUploads] = useState([]);
   const [routeSaving, setRouteSaving] = useState(false);
   const [routePlanReady, setRoutePlanReady] = useState(false);
   const [routeAddressOverrides, setRouteAddressOverrides] = useState({});
@@ -453,28 +479,135 @@ export default function App() {
     }
   }
 
-  async function uploadPhoto(useCamera) {
+  function resetPhotoSessionState() {
+    setPendingPhotoAsset(null);
+    setPendingPhotoLabel("");
+    setPhotoSessionUploads([]);
+  }
+
+  async function closePhotoSession() {
+    setPhotoSessionVisible(false);
+    resetPhotoSessionState();
+    if (selectedClaimKey) {
+      await loadClaimDetail(selectedClaimKey);
+    }
+  }
+
+  async function capturePhotoForSession() {
     if (!selectedClaimKey) {
       return;
     }
     setUploadingPhoto(true);
     try {
-      const permission = useCamera
-        ? await ImagePicker.requestCameraPermissionsAsync()
-        : await ImagePicker.requestMediaLibraryPermissionsAsync();
+      const permission = await ImagePicker.requestCameraPermissionsAsync();
       if (!permission.granted) {
-        throw new Error(
-          useCamera ? "Camera permission is required." : "Photo library permission is required."
-        );
+        throw new Error("Camera permission is required.");
       }
 
-      const result = useCamera
-        ? await ImagePicker.launchCameraAsync({ quality: 0.9 })
-        : await ImagePicker.launchImageLibraryAsync({
-            quality: 0.9,
-            allowsMultipleSelection: true,
-            selectionLimit: 0,
-          });
+      const cameraOptions = { quality: 0.9 };
+      if (ImagePicker.CameraType?.back) {
+        cameraOptions.cameraType = ImagePicker.CameraType.back;
+      }
+
+      const result = await ImagePicker.launchCameraAsync(cameraOptions);
+      if (result.canceled || !result.assets?.length) {
+        return;
+      }
+
+      setPendingPhotoAsset(result.assets[0]);
+      setPendingPhotoLabel("");
+      setPhotoSessionVisible(true);
+    } catch (err) {
+      handleError(err);
+    } finally {
+      setUploadingPhoto(false);
+    }
+  }
+
+  async function openPhotoSession() {
+    if (!selectedClaimKey) {
+      return;
+    }
+    resetPhotoSessionState();
+    setPhotoSessionVisible(true);
+    await capturePhotoForSession();
+  }
+
+  async function savePendingPhoto({ takeNext = false, finishAfter = false } = {}) {
+    if (!selectedClaimKey || !pendingPhotoAsset) {
+      return;
+    }
+    if (!pendingPhotoLabel) {
+      setError("Pick a photo label before saving.");
+      return;
+    }
+
+    let continueCapture = false;
+    try {
+      setUploadingPhoto(true);
+      setError("");
+      const uploadAsset = await prepareUploadPhoto(pendingPhotoAsset);
+      const formData = new FormData();
+      formData.append("photo", {
+        uri: uploadAsset.uri,
+        name: uploadAsset.name,
+        type: uploadAsset.type,
+      });
+
+      const payload = await fetchJson(
+        `/api/mobile/upload-photo?key=${encodeURIComponent(selectedClaimKey)}&label=${encodeURIComponent(pendingPhotoLabel)}`,
+        {
+          method: "POST",
+          body: formData,
+        }
+      );
+
+      const savedName = payload?.file?.name || pendingPhotoLabel;
+      startTransition(() => {
+        setPhotoSessionUploads((current) => [savedName, ...current].slice(0, 12));
+      });
+      setPendingPhotoAsset(null);
+      setPendingPhotoLabel("");
+      setUpdateMessage(`${savedName} saved.`);
+      await loadClaimDetail(selectedClaimKey);
+      continueCapture = takeNext;
+
+      if (finishAfter) {
+        await closePhotoSession();
+      }
+    } catch (err) {
+      handleError(err);
+    } finally {
+      setUploadingPhoto(false);
+    }
+
+    if (continueCapture && !finishAfter) {
+      await capturePhotoForSession();
+    }
+  }
+
+  async function retakePendingPhoto() {
+    setPendingPhotoAsset(null);
+    setPendingPhotoLabel("");
+    await capturePhotoForSession();
+  }
+
+  async function uploadPhotosFromLibrary() {
+    if (!selectedClaimKey) {
+      return;
+    }
+    setUploadingPhoto(true);
+    try {
+      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!permission.granted) {
+        throw new Error("Photo library permission is required.");
+      }
+
+      const result = await ImagePicker.launchImageLibraryAsync({
+        quality: 0.9,
+        allowsMultipleSelection: true,
+        selectionLimit: 0,
+      });
 
       if (result.canceled || !result.assets?.length) {
         return;
@@ -915,14 +1048,22 @@ export default function App() {
 
                 <View style={styles.card}>
                   <Text style={styles.section}>Photos</Text>
-                  <Text style={styles.helper}>Save photos straight into this claim folder on your PC.</Text>
+                  <Text style={styles.helper}>
+                    Save photos straight into this claim folder on your PC. The photo session keeps you in a continuous capture flow.
+                  </Text>
                   <View style={styles.photoRow}>
                     <Action
-                      label={uploadingPhoto ? "Uploading..." : "Take Photo"}
-                      onPress={() => uploadPhoto(true)}
+                      label={uploadingPhoto ? "Working..." : "Take Photos"}
+                      onPress={openPhotoSession}
                       compact
+                      disabled={uploadingPhoto}
                     />
-                    <Action label="Upload Photos" onPress={() => uploadPhoto(false)} compact />
+                    <Action
+                      label={uploadingPhoto ? "Working..." : "Upload Photos"}
+                      onPress={uploadPhotosFromLibrary}
+                      compact
+                      disabled={uploadingPhoto}
+                    />
                   </View>
                 </View>
 
@@ -954,6 +1095,114 @@ export default function App() {
                 </View>
               </ScrollView>
             )}
+          </View>
+        </SafeAreaView>
+      </Modal>
+
+      <Modal visible={photoSessionVisible} animationType="slide" onRequestClose={closePhotoSession}>
+        <SafeAreaView style={styles.safe}>
+          <View style={styles.shell}>
+            <View style={styles.modalHead}>
+              <Pressable style={styles.smallBtn} onPress={closePhotoSession}>
+                <Text style={styles.smallBtnText}>Back</Text>
+              </Pressable>
+              <Text style={styles.modalTitle}>Photo Session</Text>
+              <Pressable style={styles.smallBtn} onPress={closePhotoSession}>
+                <Text style={styles.smallBtnText}>Done</Text>
+              </Pressable>
+            </View>
+
+            <ScrollView contentContainerStyle={styles.scrollPad}>
+              <View style={styles.card}>
+                <Text style={styles.section}>{claimDetail?.customer_name || claimDetail?.title || "Claim"}</Text>
+                <Text style={styles.helper}>
+                  The rear camera opens first. After each shot, pick the photo label, save it, and keep going until you are done.
+                </Text>
+                <Text style={styles.helperStrong}>
+                  {photoSessionUploads.length
+                    ? `${photoSessionUploads.length} photo${photoSessionUploads.length === 1 ? "" : "s"} saved in this session.`
+                    : "No photos saved in this session yet."}
+                </Text>
+                {photoSessionUploads.length ? (
+                  <View style={styles.photoSessionSavedList}>
+                    {photoSessionUploads.map((name) => (
+                      <Text key={name} style={styles.photoSessionSavedItem}>
+                        {name}
+                      </Text>
+                    ))}
+                  </View>
+                ) : null}
+              </View>
+
+              {pendingPhotoAsset ? (
+                <View style={styles.card}>
+                  <Text style={styles.section}>Label This Photo</Text>
+                  <Image source={{ uri: pendingPhotoAsset.uri }} style={styles.photoPreview} />
+                  <Text style={styles.helper}>
+                    Pick the name for this photo. If the same label is used again, the app will number it automatically.
+                  </Text>
+                  <View style={styles.photoLabelGrid}>
+                    {PHOTO_LABEL_OPTIONS.map((label) => (
+                      <Pressable
+                        key={label}
+                        onPress={() => setPendingPhotoLabel(label)}
+                        style={[
+                          styles.photoLabelChip,
+                          pendingPhotoLabel === label && styles.photoLabelChipActive,
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.photoLabelChipText,
+                            pendingPhotoLabel === label && styles.photoLabelChipTextActive,
+                          ]}
+                        >
+                          {label}
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                  <View style={styles.stack}>
+                    <Action
+                      label={uploadingPhoto ? "Saving..." : "Save & Next Photo"}
+                      primary
+                      onPress={() => savePendingPhoto({ takeNext: true })}
+                      disabled={uploadingPhoto || !pendingPhotoLabel}
+                    />
+                    <Action
+                      label={uploadingPhoto ? "Saving..." : "Save & Finish"}
+                      onPress={() => savePendingPhoto({ finishAfter: true })}
+                      disabled={uploadingPhoto || !pendingPhotoLabel}
+                    />
+                    <Action
+                      label={uploadingPhoto ? "Working..." : "Retake Photo"}
+                      onPress={retakePendingPhoto}
+                      disabled={uploadingPhoto}
+                    />
+                  </View>
+                </View>
+              ) : (
+                <View style={styles.card}>
+                  <Text style={styles.section}>Capture</Text>
+                  <Text style={styles.helper}>
+                    Stay in this screen while working. Tap below for the next shot, and tap Done when all photos are finished.
+                  </Text>
+                  <View style={styles.stack}>
+                    <Action
+                      label={uploadingPhoto ? "Opening Camera..." : photoSessionUploads.length ? "Take Next Photo" : "Take First Photo"}
+                      primary
+                      onPress={capturePhotoForSession}
+                      disabled={uploadingPhoto}
+                    />
+                    <Action
+                      label="Done With Photos"
+                      onPress={closePhotoSession}
+                      disabled={uploadingPhoto}
+                    />
+                  </View>
+                </View>
+              )}
+            </ScrollView>
           </View>
         </SafeAreaView>
       </Modal>
@@ -1856,6 +2105,49 @@ const styles = StyleSheet.create({
   photoRow: {
     flexDirection: "row",
     gap: 10,
+  },
+  photoPreview: {
+    width: "100%",
+    aspectRatio: 3 / 4,
+    borderRadius: 18,
+    backgroundColor: "#dce5f0",
+  },
+  photoLabelGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  photoLabelChip: {
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    backgroundColor: "#edf3fa",
+    borderWidth: 1,
+    borderColor: "#d5e0ee",
+  },
+  photoLabelChipActive: {
+    backgroundColor: "#103c6d",
+    borderColor: "#103c6d",
+  },
+  photoLabelChipText: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#17395d",
+  },
+  photoLabelChipTextActive: {
+    color: "#ffffff",
+  },
+  photoSessionSavedList: {
+    gap: 6,
+  },
+  photoSessionSavedItem: {
+    fontSize: 12,
+    lineHeight: 17,
+    color: "#445a77",
+    backgroundColor: "#f6f9fc",
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
   },
   routeEditor: {
     marginTop: 10,
