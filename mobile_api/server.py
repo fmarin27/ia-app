@@ -842,8 +842,21 @@ class MobileApiHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _request_base_url(self) -> str:
-        host = self.headers.get("Host") or f"127.0.0.1:{PORT}"
-        return f"http://{host}"
+        host = clean_text(self.headers.get("X-Forwarded-Host") or self.headers.get("Host")) or f"127.0.0.1:{PORT}"
+        host = host.split(",")[0].strip()
+
+        proto = clean_text(self.headers.get("X-Forwarded-Proto")).lower()
+        if not proto:
+            cf_visitor = clean_text(self.headers.get("Cf-Visitor"))
+            if cf_visitor:
+                try:
+                    proto = clean_text(json.loads(cf_visitor).get("scheme")).lower()
+                except Exception:
+                    proto = ""
+        if proto not in {"http", "https"}:
+            proto = "https" if host and not host.startswith(("127.0.0.1", "localhost")) else "http"
+
+        return f"{proto}://{host}"
 
     def _send_json(self, payload: dict, status: int = 200) -> None:
         body = json.dumps(payload).encode("utf-8")
