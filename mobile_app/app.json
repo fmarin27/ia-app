@@ -2,7 +2,7 @@
   "expo": {
     "name": "Claim Manager Mobile",
     "slug": "claim-manager-mobile",
-    "version": "1.0.4",
+    "version": "1.0.5",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
     "runtimeVersion": {
@@ -27,14 +27,20 @@
             "usesCleartextTraffic": true
           }
         }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow Claim Manager Mobile to use your camera to take claim photos."
+        }
       ]
     ],
     "android": {
-      "versionCode": 6,
+      "versionCode": 7,
       "package": "com.fmarin.claimmanagermobile"
     },
     "ios": {
-      "buildNumber": "6",
+      "buildNumber": "7",
       "bundleIdentifier": "com.fmarin.claimmanagermobile"
     },
     "extra": {

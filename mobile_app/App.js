@@ -24,6 +24,7 @@ import {
   View,
 } from "react-native";
 import { StatusBar as ExpoStatusBar } from "expo-status-bar";
+import { CameraView, useCameraPermissions } from "expo-camera";
 import * as ImagePicker from "expo-image-picker";
 import * as ImageManipulator from "expo-image-manipulator";
 import * as Updates from "expo-updates";
@@ -82,36 +83,49 @@ const PHOTO_LABEL_OPTIONS = [
   "OTHER",
 ];
 
+const MOBILE_PHOTO_MAX_SIDE = 1536;
+const MOBILE_PHOTO_PRIMARY_COMPRESSION = 0.4;
+const MOBILE_PHOTO_SECONDARY_COMPRESSION = 0.34;
+const MOBILE_PHOTO_HEAVY_COMPRESSION = 0.3;
+
 async function prepareUploadPhoto(asset) {
   const manipulations = [];
   const width = asset.width || 0;
   const height = asset.height || 0;
   const longestSide = Math.max(width, height);
 
-  if (longestSide > 1280) {
+  if (longestSide > MOBILE_PHOTO_MAX_SIDE) {
     if (width >= height) {
-      manipulations.push({ resize: { width: 1280 } });
+      manipulations.push({ resize: { width: MOBILE_PHOTO_MAX_SIDE } });
     } else {
-      manipulations.push({ resize: { height: 1280 } });
+      manipulations.push({ resize: { height: MOBILE_PHOTO_MAX_SIDE } });
     }
+  }
+
+  let compression = MOBILE_PHOTO_PRIMARY_COMPRESSION;
+  if ((asset.fileSize || 0) > 3000000 || longestSide > 2500) {
+    compression = MOBILE_PHOTO_SECONDARY_COMPRESSION;
+  }
+  if ((asset.fileSize || 0) > 6000000 || longestSide > 3500) {
+    compression = MOBILE_PHOTO_HEAVY_COMPRESSION;
   }
 
   let result = await ImageManipulator.manipulateAsync(
     asset.uri,
     manipulations,
     {
-      compress: 0.28,
+      compress: compression,
       format: ImageManipulator.SaveFormat.JPEG,
       base64: false,
     }
   );
 
-  if ((asset.fileSize || 0) > 500000) {
+  if ((asset.fileSize || 0) > 8000000) {
     result = await ImageManipulator.manipulateAsync(
       result.uri,
       [],
       {
-        compress: 0.18,
+        compress: MOBILE_PHOTO_HEAVY_COMPRESSION,
         format: ImageManipulator.SaveFormat.JPEG,
         base64: false,
       }
@@ -162,6 +176,7 @@ export default function App() {
   const [pendingPhotoAsset, setPendingPhotoAsset] = useState(null);
   const [pendingPhotoLabel, setPendingPhotoLabel] = useState("");
   const [photoSessionUploads, setPhotoSessionUploads] = useState([]);
+  const [cameraReady, setCameraReady] = useState(false);
   const [routeSaving, setRouteSaving] = useState(false);
   const [routePlanReady, setRoutePlanReady] = useState(false);
   const [routeAddressOverrides, setRouteAddressOverrides] = useState({});
@@ -176,7 +191,9 @@ export default function App() {
   const [updateMessage, setUpdateMessage] = useState("");
   const [apiReady, setApiReady] = useState(false);
   const loadSequence = useRef(0);
+  const cameraRef = useRef(null);
   const deferredSearch = useDeferredValue(search);
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const currentChannel = Updates.channel || "preview";
   const currentRuntimeVersion = Updates.runtimeVersion || APP_VERSION;
   const currentUpdateId = Updates.updateId ? Updates.updateId.slice(0, 8) : "embedded";
@@ -483,6 +500,7 @@ export default function App() {
     setPendingPhotoAsset(null);
     setPendingPhotoLabel("");
     setPhotoSessionUploads([]);
+    setCameraReady(false);
   }
 
   async function closePhotoSession() {
@@ -497,26 +515,29 @@ export default function App() {
     if (!selectedClaimKey) {
       return;
     }
+    if (!cameraPermission?.granted) {
+      const permission = await requestCameraPermission();
+      if (!permission.granted) {
+        setError("Camera permission is required.");
+        return;
+      }
+    }
+    if (!cameraReady || !cameraRef.current?.takePictureAsync) {
+      setError("Camera is still getting ready.");
+      return;
+    }
     setUploadingPhoto(true);
     try {
-      const permission = await ImagePicker.requestCameraPermissionsAsync();
-      if (!permission.granted) {
-        throw new Error("Camera permission is required.");
-      }
-
-      const cameraOptions = { quality: 0.9 };
-      if (ImagePicker.CameraType?.back) {
-        cameraOptions.cameraType = ImagePicker.CameraType.back;
-      }
-
-      const result = await ImagePicker.launchCameraAsync(cameraOptions);
-      if (result.canceled || !result.assets?.length) {
+      const result = await cameraRef.current.takePictureAsync({
+        quality: 0.9,
+        shutterSound: false,
+      });
+      if (!result?.uri) {
         return;
       }
 
-      setPendingPhotoAsset(result.assets[0]);
+      setPendingPhotoAsset(result);
       setPendingPhotoLabel("");
-      setPhotoSessionVisible(true);
     } catch (err) {
       handleError(err);
     } finally {
@@ -528,12 +549,17 @@ export default function App() {
     if (!selectedClaimKey) {
       return;
     }
+    const permission = cameraPermission?.granted ? cameraPermission : await requestCameraPermission();
+    if (!permission?.granted) {
+      setError("Camera permission is required.");
+      return;
+    }
     resetPhotoSessionState();
     setPhotoSessionVisible(true);
-    await capturePhotoForSession();
+    setError("");
   }
 
-  async function savePendingPhoto({ takeNext = false, finishAfter = false } = {}) {
+  async function savePendingPhoto({ finishAfter = false } = {}) {
     if (!selectedClaimKey || !pendingPhotoAsset) {
       return;
     }
@@ -542,7 +568,6 @@ export default function App() {
       return;
     }
 
-    let continueCapture = false;
     try {
       setUploadingPhoto(true);
       setError("");
@@ -566,11 +591,11 @@ export default function App() {
       startTransition(() => {
         setPhotoSessionUploads((current) => [savedName, ...current].slice(0, 12));
       });
+      setCameraReady(false);
       setPendingPhotoAsset(null);
       setPendingPhotoLabel("");
       setUpdateMessage(`${savedName} saved.`);
       await loadClaimDetail(selectedClaimKey);
-      continueCapture = takeNext;
 
       if (finishAfter) {
         await closePhotoSession();
@@ -580,16 +605,12 @@ export default function App() {
     } finally {
       setUploadingPhoto(false);
     }
-
-    if (continueCapture && !finishAfter) {
-      await capturePhotoForSession();
-    }
   }
 
   async function retakePendingPhoto() {
     setPendingPhotoAsset(null);
     setPendingPhotoLabel("");
-    await capturePhotoForSession();
+    setCameraReady(false);
   }
 
   async function uploadPhotosFromLibrary() {
@@ -1166,7 +1187,7 @@ export default function App() {
                     <Action
                       label={uploadingPhoto ? "Saving..." : "Save & Next Photo"}
                       primary
-                      onPress={() => savePendingPhoto({ takeNext: true })}
+                      onPress={() => savePendingPhoto()}
                       disabled={uploadingPhoto || !pendingPhotoLabel}
                     />
                     <Action
@@ -1184,22 +1205,53 @@ export default function App() {
               ) : (
                 <View style={styles.card}>
                   <Text style={styles.section}>Capture</Text>
-                  <Text style={styles.helper}>
-                    Stay in this screen while working. Tap below for the next shot, and tap Done when all photos are finished.
-                  </Text>
-                  <View style={styles.stack}>
-                    <Action
-                      label={uploadingPhoto ? "Opening Camera..." : photoSessionUploads.length ? "Take Next Photo" : "Take First Photo"}
-                      primary
-                      onPress={capturePhotoForSession}
-                      disabled={uploadingPhoto}
-                    />
-                    <Action
-                      label="Done With Photos"
-                      onPress={closePhotoSession}
-                      disabled={uploadingPhoto}
-                    />
-                  </View>
+                  {cameraPermission?.granted ? (
+                    <>
+                      <Text style={styles.helper}>
+                        Stay in this screen while working. The camera below is locked to the rear lens.
+                      </Text>
+                      <View style={styles.cameraWrap}>
+                        <CameraView
+                          ref={cameraRef}
+                          style={styles.cameraPreview}
+                          facing="back"
+                          mode="picture"
+                          active={photoSessionVisible && !pendingPhotoAsset}
+                          onCameraReady={() => setCameraReady(true)}
+                          onMountError={(event) => handleError(new Error(event?.message || "Camera could not start."))}
+                        />
+                      </View>
+                      <View style={styles.stack}>
+                        <Action
+                          label={
+                            uploadingPhoto
+                              ? "Capturing..."
+                              : !cameraReady
+                                ? "Loading Camera..."
+                                : photoSessionUploads.length
+                                  ? "Take Next Photo"
+                                  : "Take First Photo"
+                          }
+                          primary
+                          onPress={capturePhotoForSession}
+                          disabled={uploadingPhoto || !cameraReady}
+                        />
+                        <Action
+                          label="Done With Photos"
+                          onPress={closePhotoSession}
+                          disabled={uploadingPhoto}
+                        />
+                      </View>
+                    </>
+                  ) : (
+                    <View style={styles.stack}>
+                      <Text style={styles.helper}>
+                        Camera permission is needed before you can take claim photos in the app.
+                      </Text>
+                      <Action label="Allow Camera" primary onPress={openPhotoSession} disabled={uploadingPhoto} />
+                      <Action label="Done With Photos" onPress={closePhotoSession} disabled={uploadingPhoto} />
+                    </View>
+                  )}
                 </View>
               )}
             </ScrollView>
@@ -2111,6 +2163,17 @@ const styles = StyleSheet.create({
     aspectRatio: 3 / 4,
     borderRadius: 18,
     backgroundColor: "#dce5f0",
+  },
+  cameraWrap: {
+    overflow: "hidden",
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: "#d7e1ee",
+    backgroundColor: "#0c1623",
+  },
+  cameraPreview: {
+    width: "100%",
+    aspectRatio: 3 / 4,
   },
   photoLabelGrid: {
     flexDirection: "row",
