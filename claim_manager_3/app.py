@@ -127,7 +127,7 @@ except Exception:
 APP_NAME = "Claim Manager 3.0"
 APP_VERSION = "3.0.1"
 DESKTOP_UPDATE_BRANCH = "desktop-updates"
-DESKTOP_UPDATE_MANIFEST_URL = f"https://raw.githubusercontent.com/fmarin27/ia-app/{DESKTOP_UPDATE_BRANCH}/claim_manager_3/desktop_update/latest.json"
+DESKTOP_UPDATE_MANIFEST_URL = f"https://api.github.com/repos/fmarin27/ia-app/contents/claim_manager_3/desktop_update/latest.json?ref={DESKTOP_UPDATE_BRANCH}"
 DESKTOP_UPDATE_CONFIG_FILE = APP_DIR / "desktop_update_config.json"
 SECRETS_FILE = APP_DIR / "claims_secrets.json"
 APPTRAK_AUTOMATION_DIR = Path(r"C:\AMobile\automation")
@@ -1617,6 +1617,9 @@ class ClaimsDashboard(QMainWindow):
             )
             with urlopen(request, timeout=12) as response:
                 payload = json.loads(response.read().decode("utf-8"))
+            if "content" in payload and str(payload.get("encoding", "") or "").lower() == "base64":
+                decoded = base64.b64decode(str(payload.get("content", "") or ""))
+                payload = json.loads(decoded.decode("utf-8"))
             version = str(payload.get("version", "") or "").strip()
             installer_url = str(payload.get("installer_url", "") or "").strip()
             if not version or not installer_url:
