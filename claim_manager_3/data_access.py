@@ -26,7 +26,11 @@ def _runtime_app_dir() -> Path:
     if portable_home:
         return Path(portable_home).expanduser().resolve()
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
+        exe_dir = Path(sys.executable).resolve().parent
+        for candidate in (exe_dir, exe_dir.parent):
+            if (candidate / "claims_data.json").exists() or (candidate / "PENDING CLAIMS").exists():
+                return candidate
+        return exe_dir
     return Path(__file__).resolve().parents[1]
 
 

@@ -10,6 +10,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import textwrap
@@ -19,14 +20,20 @@ from datetime import datetime, timedelta
 from email.message import EmailMessage
 from io import BytesIO
 from pathlib import Path
+from urllib.error import URLError
 from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 def _runtime_app_dir() -> Path:
     portable_home = (os.environ.get("CLAIM_MANAGER_HOME") or "").strip()
     if portable_home:
         return Path(portable_home).expanduser().resolve()
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
+        exe_dir = Path(sys.executable).resolve().parent
+        for candidate in (exe_dir, exe_dir.parent):
+            if (candidate / "claims_data.json").exists() or (candidate / "PENDING CLAIMS").exists():
+                return candidate
+        return exe_dir
     return Path(__file__).resolve().parents[1]
 
 
@@ -38,7 +45,7 @@ if VENDOR_DIR.exists():
     if vendor_path not in sys.path:
         sys.path.insert(0, vendor_path)
 
-from PySide6.QtCore import QDate, QObject, QPoint, Qt, QUrl, Signal
+from PySide6.QtCore import QDate, QObject, QPoint, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFontMetrics
 from PySide6.QtWidgets import (
     QApplication,
@@ -118,6 +125,10 @@ except Exception:
 
 
 APP_NAME = "Claim Manager 3.0"
+APP_VERSION = "3.0.1"
+DESKTOP_UPDATE_BRANCH = "desktop-updates"
+DESKTOP_UPDATE_MANIFEST_URL = f"https://raw.githubusercontent.com/fmarin27/ia-app/{DESKTOP_UPDATE_BRANCH}/claim_manager_3/desktop_update/latest.json"
+DESKTOP_UPDATE_CONFIG_FILE = APP_DIR / "desktop_update_config.json"
 SECRETS_FILE = APP_DIR / "claims_secrets.json"
 APPTRAK_AUTOMATION_DIR = Path(r"C:\AMobile\automation")
 APPTRAK_IMPORT_BAT = APPTRAK_AUTOMATION_DIR / "Run-AppTrakImport.bat"
@@ -143,6 +154,30 @@ OPEN_CLAIM_TABLE_HEADERS = CLAIM_TABLE_HEADERS + ["Progress"]
 OFFICE_TABLE_HEADERS = ["Claim ID", "Customer", "Shop", "Inspection When", "Progress", "Additional Notes"]
 REPORT_TABLE_HEADERS = ["Closed Date", "Claim ID", "Customer", "Insurance", "Type"]
 REPORT_NULL_QDATE = QDate(2000, 1, 1)
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    parts = [int(part) for part in re.findall(r"\d+", version)]
+    return tuple(parts) if parts else (0,)
+
+
+def _load_desktop_update_config() -> dict[str, object]:
+    default_config: dict[str, object] = {
+        "enabled": True,
+        "channel": "stable",
+        "manifest_url": DESKTOP_UPDATE_MANIFEST_URL,
+    }
+    if not DESKTOP_UPDATE_CONFIG_FILE.exists():
+        return default_config
+    try:
+        raw = json.loads(DESKTOP_UPDATE_CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default_config
+    config = {**default_config, **raw}
+    config["enabled"] = bool(config.get("enabled", True))
+    config["channel"] = str(config.get("channel", "") or "stable").strip() or "stable"
+    config["manifest_url"] = str(config.get("manifest_url", "") or DESKTOP_UPDATE_MANIFEST_URL).strip() or DESKTOP_UPDATE_MANIFEST_URL
+    return config
 
 
 class RecordEditorDialog(QDialog):
@@ -511,6 +546,9 @@ class RefreshScanWorkerSignals(QObject):
 
 
 class ClaimsDashboard(QMainWindow):
+    update_manifest_ready = Signal(object)
+    update_download_ready = Signal(object)
+
     def __init__(self) -> None:
         super().__init__()
         self.repo = ClaimsRepository()
@@ -530,16 +568,23 @@ class ClaimsDashboard(QMainWindow):
         self.processed_apptrak_pdfs: list[str] = []
         self.apptrak_import_running = False
         self.refresh_scan_running = False
+        self.desktop_update_config = _load_desktop_update_config()
+        self._update_check_in_progress = False
+        self._update_download_in_progress = False
         self.apptrak_signals = AppTrakWorkerSignals()
         self.apptrak_signals.finished.connect(self._finish_apptrak_import_cycle)
         self.refresh_scan_signals = RefreshScanWorkerSignals()
         self.refresh_scan_signals.finished.connect(self._finish_refresh_scan)
+        self.update_manifest_ready.connect(self._handle_update_manifest_result)
+        self.update_download_ready.connect(self._handle_update_download_result)
 
         self.setWindowTitle(APP_NAME)
         self.resize(1440, 900)
         self.setMinimumSize(1180, 760)
         self._build_ui()
         self._load_claims()
+        if getattr(sys, "frozen", False) and bool(self.desktop_update_config.get("enabled", True)):
+            QTimer.singleShot(1500, self._check_for_desktop_updates_on_launch)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -1344,6 +1389,10 @@ class ClaimsDashboard(QMainWindow):
     def _build_future_settings_text(self) -> str:
         return "\n".join(
             [
+                f"Desktop Version: {APP_VERSION}",
+                f"Desktop Update Channel: {str(self.desktop_update_config.get('channel', 'stable') or 'stable')}",
+                f"Desktop Update Source: {str(self.desktop_update_config.get('manifest_url', '') or '-')}",
+                "",
                 "Planned sections",
                 "  User Profile",
                 "  Email Preferences",
@@ -1456,6 +1505,17 @@ class ClaimsDashboard(QMainWindow):
         future_title.setObjectName("sectionTitle")
         future_layout.addWidget(future_title)
 
+        desktop_update_row = QHBoxLayout()
+        desktop_update_row.setSpacing(10)
+        desktop_update_label = QLabel(f"Desktop Version {APP_VERSION}")
+        desktop_update_label.setObjectName("workspaceStripHint")
+        desktop_update_row.addWidget(desktop_update_label)
+        desktop_update_row.addStretch(1)
+        check_update_button = QPushButton("Check for Desktop Update")
+        check_update_button.setObjectName("compactActionButton")
+        desktop_update_row.addWidget(check_update_button)
+        future_layout.addLayout(desktop_update_row)
+
         future_view = QPlainTextEdit()
         future_view.setReadOnly(True)
         future_view.setMaximumHeight(150)
@@ -1515,8 +1575,179 @@ class ClaimsDashboard(QMainWindow):
         save_email_button.clicked.connect(save_email_settings)
         reset_email_button.clicked.connect(reset_email_defaults)
         copy_email_button.clicked.connect(copy_email_settings)
+        check_update_button.clicked.connect(lambda: self._check_for_desktop_update(manual=True))
 
         dialog.exec()
+
+    def _check_for_desktop_updates_on_launch(self) -> None:
+        self._check_for_desktop_update(manual=False)
+
+    def _check_for_desktop_update(self, manual: bool) -> None:
+        self.desktop_update_config = _load_desktop_update_config()
+        if not getattr(sys, "frozen", False):
+            if manual:
+                QMessageBox.information(self, APP_NAME, "Desktop updates are only available from the installed desktop app build.")
+            return
+        if not bool(self.desktop_update_config.get("enabled", True)):
+            if manual:
+                QMessageBox.information(self, APP_NAME, "Desktop updates are disabled for this install.")
+            return
+        manifest_url = str(self.desktop_update_config.get("manifest_url", "") or "").strip()
+        if not manifest_url:
+            if manual:
+                QMessageBox.warning(self, APP_NAME, "No desktop update manifest URL is configured for this install.")
+            return
+        if self._update_check_in_progress:
+            if manual:
+                QMessageBox.information(self, APP_NAME, "A desktop update check is already running.")
+            return
+        self._update_check_in_progress = True
+        threading.Thread(
+            target=self._desktop_update_manifest_worker,
+            args=(manifest_url, manual),
+            daemon=True,
+        ).start()
+
+    def _desktop_update_manifest_worker(self, manifest_url: str, manual: bool) -> None:
+        result: dict[str, object] = {"manual": manual}
+        try:
+            request = Request(
+                manifest_url,
+                headers={"User-Agent": f"ClaimManager3Desktop/{APP_VERSION}"},
+            )
+            with urlopen(request, timeout=12) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            version = str(payload.get("version", "") or "").strip()
+            installer_url = str(payload.get("installer_url", "") or "").strip()
+            if not version or not installer_url:
+                raise ValueError("Update manifest is missing version or installer_url.")
+            result["manifest"] = {
+                "version": version,
+                "installer_url": installer_url,
+                "notes": str(payload.get("notes", "") or "").strip(),
+                "published_at": str(payload.get("published_at", "") or "").strip(),
+            }
+        except Exception as exc:
+            result["error"] = str(exc)
+        self.update_manifest_ready.emit(result)
+
+    def _handle_update_manifest_result(self, result: object) -> None:
+        payload = result if isinstance(result, dict) else {}
+        self._update_check_in_progress = False
+        manual = bool(payload.get("manual", False))
+        error = str(payload.get("error", "") or "").strip()
+        if error:
+            if manual:
+                QMessageBox.warning(self, APP_NAME, f"Could not check for a desktop update.\n\n{error}")
+            return
+        manifest = payload.get("manifest")
+        if not isinstance(manifest, dict):
+            if manual:
+                QMessageBox.warning(self, APP_NAME, "Desktop update check returned an invalid manifest.")
+            return
+        remote_version = str(manifest.get("version", "") or "").strip()
+        if _version_key(remote_version) <= _version_key(APP_VERSION):
+            if manual:
+                QMessageBox.information(self, APP_NAME, f"You are already on the latest desktop version.\n\nCurrent version: {APP_VERSION}")
+            return
+        message = [
+            "A desktop update is available.",
+            "",
+            f"Current version: {APP_VERSION}",
+            f"New version: {remote_version}",
+        ]
+        notes = str(manifest.get("notes", "") or "").strip()
+        if notes:
+            message.extend(["", notes])
+        message.extend(["", "Download and install it now?"])
+        if QMessageBox.question(
+            self,
+            APP_NAME,
+            "\n".join(message),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        ) != QMessageBox.Yes:
+            return
+        self._download_desktop_update(manifest)
+
+    def _download_desktop_update(self, manifest: dict[str, object]) -> None:
+        if self._update_download_in_progress:
+            QMessageBox.information(self, APP_NAME, "A desktop update download is already running.")
+            return
+        self._update_download_in_progress = True
+        threading.Thread(
+            target=self._desktop_update_download_worker,
+            args=(dict(manifest),),
+            daemon=True,
+        ).start()
+
+    def _desktop_update_download_worker(self, manifest: dict[str, object]) -> None:
+        result: dict[str, object] = {"manifest": manifest}
+        try:
+            version = str(manifest.get("version", "") or "").strip() or "update"
+            installer_url = str(manifest.get("installer_url", "") or "").strip()
+            if not installer_url:
+                raise ValueError("The update manifest did not include an installer URL.")
+            download_dir = Path(tempfile.gettempdir()) / "claim_manager_3_updates"
+            download_dir.mkdir(parents=True, exist_ok=True)
+            installer_path = download_dir / f"Claim-Manager-3-Setup-{version}.exe"
+            request = Request(
+                installer_url,
+                headers={"User-Agent": f"ClaimManager3Desktop/{APP_VERSION}"},
+            )
+            with urlopen(request, timeout=60) as response, installer_path.open("wb") as output_file:
+                shutil.copyfileobj(response, output_file)
+            result["installer_path"] = str(installer_path)
+        except Exception as exc:
+            result["error"] = str(exc)
+        self.update_download_ready.emit(result)
+
+    def _handle_update_download_result(self, result: object) -> None:
+        payload = result if isinstance(result, dict) else {}
+        self._update_download_in_progress = False
+        error = str(payload.get("error", "") or "").strip()
+        if error:
+            QMessageBox.warning(self, APP_NAME, f"Could not download the desktop update.\n\n{error}")
+            return
+        installer_path = Path(str(payload.get("installer_path", "") or "").strip())
+        if not installer_path.exists():
+            QMessageBox.warning(self, APP_NAME, "The desktop update finished downloading, but the installer could not be found.")
+            return
+        manifest = payload.get("manifest")
+        version = ""
+        if isinstance(manifest, dict):
+            version = str(manifest.get("version", "") or "").strip()
+        message = "The new desktop installer is ready."
+        if version:
+            message += f"\n\nVersion: {version}"
+        message += "\n\nClaim Manager will close and start the installer."
+        if QMessageBox.question(
+            self,
+            APP_NAME,
+            message,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        ) != QMessageBox.Yes:
+            return
+        self._launch_desktop_update_installer(installer_path)
+
+    def _launch_desktop_update_installer(self, installer_path: Path) -> None:
+        runner_path = Path(tempfile.gettempdir()) / f"claim-manager-update-{int(time.time())}.cmd"
+        runner_path.write_text(
+            "\n".join(
+                [
+                    "@echo off",
+                    "setlocal",
+                    "timeout /t 2 /nobreak >nul",
+                    f"start \"\" /wait \"{installer_path}\" /SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /FORCECLOSEAPPLICATIONS",
+                    "endlocal",
+                ]
+            ),
+            encoding="ascii",
+        )
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen(["cmd.exe", "/c", str(runner_path)], creationflags=creation_flags)
+        QApplication.instance().quit()
 
     def _build_reports_tab(self) -> QWidget:
         wrapper = QWidget()
@@ -6480,6 +6711,7 @@ finally {{
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
     window = ClaimsDashboard()
     window.show()
     return app.exec()

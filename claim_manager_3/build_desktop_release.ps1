@@ -5,6 +5,8 @@ $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $claimManagerDir = (Resolve-Path $PSScriptRoot).Path
 $releaseRoot = Join-Path $projectRoot "Releases\desktop_portable"
 $buildRoot = Join-Path $projectRoot "build\desktop_portable"
+$desktopUpdateBranch = "desktop-updates"
+$desktopUpdateManifestUrl = "https://raw.githubusercontent.com/fmarin27/ia-app/$desktopUpdateBranch/claim_manager_3/desktop_update/latest.json"
 
 if (Test-Path $releaseRoot) {
     Remove-Item -LiteralPath $releaseRoot -Recurse -Force
@@ -58,6 +60,11 @@ New-Item -ItemType Directory -Path (Join-Path $portableRoot "Office Updates") | 
 New-Item -ItemType Directory -Path (Join-Path $portableRoot "working_sheets") | Out-Null
 
 '{}' | Set-Content -Path (Join-Path $portableRoot "claims_data.json") -Encoding UTF8
+@{
+    enabled = $true
+    channel = "stable"
+    manifest_url = $desktopUpdateManifestUrl
+} | ConvertTo-Json | Set-Content -Path (Join-Path $portableRoot "desktop_update_config.json") -Encoding UTF8
 
 Copy-Item -Path (Join-Path $releaseRoot "Claim Manager 3") -Destination $portableRoot -Recurse -Force
 Copy-Item -Path (Join-Path $releaseRoot "Claim Manager 3 Office") -Destination $portableRoot -Recurse -Force
@@ -104,6 +111,7 @@ What this package includes
 - Claim Manager 3 Office.exe
 - packaged runtime folders for both desktop variants
 - claims_data.json
+- desktop_update_config.json
 - default folders for PENDING CLAIMS, Closed Claims, Claim Tools, Payroll, Office Updates, and working_sheets
 
 Suggested Saturday install
