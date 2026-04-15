@@ -21,7 +21,18 @@ from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote
 
-VENDOR_DIR = Path(__file__).resolve().parent / "_vendor"
+def _runtime_app_dir() -> Path:
+    portable_home = (os.environ.get("CLAIM_MANAGER_HOME") or "").strip()
+    if portable_home:
+        return Path(portable_home).expanduser().resolve()
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[1]
+
+
+APP_DIR = _runtime_app_dir()
+CLAIM_MANAGER_DIR = APP_DIR / "claim_manager_3" if (APP_DIR / "claim_manager_3").exists() else Path(__file__).resolve().parent
+VENDOR_DIR = CLAIM_MANAGER_DIR / "_vendor"
 if VENDOR_DIR.exists():
     vendor_path = str(VENDOR_DIR)
     if vendor_path not in sys.path:
@@ -107,7 +118,6 @@ except Exception:
 
 
 APP_NAME = "Claim Manager 3.0"
-APP_DIR = Path(__file__).resolve().parents[1]
 SECRETS_FILE = APP_DIR / "claims_secrets.json"
 APPTRAK_AUTOMATION_DIR = Path(r"C:\AMobile\automation")
 APPTRAK_IMPORT_BAT = APPTRAK_AUTOMATION_DIR / "Run-AppTrakImport.bat"
@@ -115,7 +125,7 @@ APPTRAK_EXE = Path(r"C:\AMobile\app\apptrak.exe")
 APPTRAK_DBF_DIR = Path(r"C:\AMobile\dbf")
 APPTRAK_DOCS_DIR = Path(r"C:\AMobile\docs")
 APPTRAK_PICS_DIR = Path(r"C:\AMobile\pics")
-REFRESH_SCAN_HELPER = APP_DIR / "claim_manager_3" / "refresh_scan_helper.py"
+REFRESH_SCAN_HELPER = CLAIM_MANAGER_DIR / "refresh_scan_helper.py"
 AUTOSOURCE_PDA_TEMPLATE = Path(r"C:\Users\ferna\Downloads\Autosource_PDA_Sub_Level.pdf")
 OFFICE_UPDATE_EMAIL_FROM = "fernandomarin27@gmail.com"
 OFFICE_UPDATE_EMAIL_TO = "ldellacorte@duhamels.com"
@@ -4915,6 +4925,37 @@ class ClaimsDashboard(QMainWindow):
         self._load_claims()
         self._reselect_current_claim()
 
+    def _meaningful_shop_name(self, value: str) -> str:
+        cleaned = (value or "").strip()
+        if cleaned.lower() in {"", "-", "n/a", "unknown", "no shop chosen"}:
+            return ""
+        return cleaned
+
+    def _ensure_shop_name_for_supplement_request(self, claim: ClaimView) -> str | None:
+        existing = self._meaningful_shop_name(claim.shop_name or "")
+        if existing:
+            return existing
+
+        shop_name, ok = QInputDialog.getText(
+            self,
+            APP_NAME,
+            "Enter the shop name for this supplement request:",
+            text="",
+        )
+        if not ok:
+            return None
+
+        shop_name = self._meaningful_shop_name(shop_name)
+        if not shop_name:
+            QMessageBox.information(self, APP_NAME, "Enter a shop name before sending the supplement request.")
+            return None
+
+        self.repo.update_claim_fields(claim.key, {"shop_name": shop_name})
+        self._load_claims()
+        self._reselect_current_claim()
+        refreshed_claim = self.current_claim if self.current_claim and self.current_claim.key == claim.key else claim
+        return self._meaningful_shop_name(refreshed_claim.shop_name or "") or shop_name
+
     def _send_review_email(self) -> None:
         if not self.current_claim:
             return
@@ -5057,18 +5098,28 @@ class ClaimsDashboard(QMainWindow):
     def _request_supplement_email(self) -> None:
         if not self.current_claim:
             return
+        shop_name = self._ensure_shop_name_for_supplement_request(self.current_claim)
+        if not shop_name or not self.current_claim:
+            return
         message = EmailMessage()
         message["From"] = OFFICE_UPDATE_EMAIL_FROM
         message["To"] = self._office_supplement_email_to()
         message["Subject"] = OFFICE_SUPPLEMENT_EMAIL_SUBJECT
-        message.set_content(self._supplement_request_email_body(self.current_claim))
+        message.set_content(self._supplement_request_email_body(self.current_claim, shop_name=shop_name))
         try:
             self._send_email_message(message)
             QMessageBox.information(self, APP_NAME, f"The supplement request email was sent to {message['To']}.")
         except Exception as exc:
             QMessageBox.warning(self, APP_NAME, f"Could not send the supplement request email:\n{exc}")
 
-    def _supplement_request_email_body(self, claim: ClaimView, greeting: str = "Hi Lisa,") -> str:
+    def _supplement_request_email_body(
+        self,
+        claim: ClaimView,
+        greeting: str = "Hi Lisa,",
+        *,
+        shop_name: str | None = None,
+    ) -> str:
+        resolved_shop_name = self._meaningful_shop_name(shop_name or claim.shop_name or "") or "-"
         return "\n".join(
             [
                 greeting,
@@ -5077,6 +5128,7 @@ class ClaimsDashboard(QMainWindow):
                 f"Customer: {claim.display_customer or '-'}",
                 f"Vehicle: {claim.vehicle or '-'}",
                 f"Insurance Company: {claim.insurance_company or '-'}",
+                f"Shop: {resolved_shop_name}",
                 "",
                 "Thank you!",
             ]

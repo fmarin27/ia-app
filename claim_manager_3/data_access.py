@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,7 +21,17 @@ except Exception:
         PdfReader = None  # type: ignore[assignment]
 
 
-APP_DIR = Path(__file__).resolve().parents[1]
+def _runtime_app_dir() -> Path:
+    portable_home = (os.environ.get("CLAIM_MANAGER_HOME") or "").strip()
+    if portable_home:
+        return Path(portable_home).expanduser().resolve()
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[1]
+
+
+APP_DIR = _runtime_app_dir()
+CLAIM_MANAGER_DIR = APP_DIR / "claim_manager_3" if (APP_DIR / "claim_manager_3").exists() else Path(__file__).resolve().parent
 DATA_FILE = APP_DIR / "claims_data.json"
 DESKTOP_MODE = (os.environ.get("CLAIM_MANAGER_DESKTOP_MODE") or "home").strip().lower()
 OFFICE_SYNC_ENABLED = DESKTOP_MODE == "office"
@@ -32,12 +43,12 @@ DEFAULT_WATCHED_FOLDERS = [
 DEFAULT_CLAIM_TOOLS_FOLDER = str(APP_DIR / "Claim Tools")
 DEFAULT_ROUTE_HOME_ADDRESS = "5 Richlee Rd, Norwalk, CT 06851"
 TESSERACT_EXE = Path(r"C:\Program Files\PDF24\tesseract\tesseract.exe")
-LOCAL_TESSDATA_DIR = APP_DIR / "claim_manager_3" / "ocr" / "tessdata"
+LOCAL_TESSDATA_DIR = CLAIM_MANAGER_DIR / "ocr" / "tessdata"
 TESSDATA_DIR = LOCAL_TESSDATA_DIR if LOCAL_TESSDATA_DIR.exists() else Path(r"C:\Program Files\PDF24\tesseract\tessdata")
 GHOSTSCRIPT_EXE = Path(r"C:\Program Files\PDF24\gs\bin\gswin64c.exe")
 BRIDGE_CONFIG_FILE = Path(
     os.environ.get("CLAIM_MANAGER_BRIDGE_CONFIG")
-    or (Path.home() / "APPS" / "Business Apps" / "IA APP" / "codex_bridge_config.json")
+    or (Path.home() / "Desktop" / "Apps" / "Business" / "Codex Bridge" / "codex_bridge_config.json")
 )
 HOME_PC_REMOTE_DATA_PATH = os.environ.get("CLAIM_MANAGER_HOME_REMOTE_DATA_PATH") or f"/{str(HOME_APP_ROOT / 'claims_data.json').replace(chr(92), '/')}"
 LOCAL_ONLY_KEYS = {
