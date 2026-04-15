@@ -5,8 +5,7 @@ $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $claimManagerDir = (Resolve-Path $PSScriptRoot).Path
 $releaseRoot = Join-Path $projectRoot "Releases\desktop_portable"
 $buildRoot = Join-Path $projectRoot "build\desktop_portable"
-$desktopUpdateBranch = "desktop-updates"
-$desktopUpdateManifestUrl = "https://api.github.com/repos/fmarin27/ia-app/contents/claim_manager_3/desktop_update/latest.json?ref=$desktopUpdateBranch"
+$desktopUpdateManifestUrl = "https://api2.luxuryimportsusa.shop/api/desktop-update/latest.json"
 
 if (Test-Path $releaseRoot) {
     Remove-Item -LiteralPath $releaseRoot -Recurse -Force

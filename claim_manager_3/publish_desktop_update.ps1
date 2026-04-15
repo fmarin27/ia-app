@@ -19,6 +19,7 @@ $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $installerBuilder = Join-Path $PSScriptRoot "build_desktop_installer.ps1"
 $manifestPath = Join-Path $PSScriptRoot "desktop_update\latest.json"
 $installerPath = Join-Path $projectRoot "Releases\desktop_installer\Claim-Manager-3-Setup-$Version.exe"
+$desktopFeedDir = Join-Path $projectRoot "Releases\desktop_update_feed"
 $targetCommit = (git -C $projectRoot rev-parse HEAD).Trim()
 
 Write-Host "Building desktop installer..."
@@ -41,14 +42,22 @@ $installerFileName = Split-Path $installerPath -Leaf
 $installerUrl = "https://github.com/fmarin27/ia-app/releases/download/$ReleaseTag/$installerFileName"
 $manifest = [ordered]@{
     version = $Version
-    installer_url = $installerUrl
+    installer_file = $installerFileName
     published_at = (Get-Date).ToString("o")
     notes = "Desktop installer update $Version"
 }
 $manifest | ConvertTo-Json | Set-Content -Path $manifestPath -Encoding UTF8
+if (Test-Path $desktopFeedDir) {
+    Remove-Item -LiteralPath $desktopFeedDir -Recurse -Force
+}
+New-Item -ItemType Directory -Path $desktopFeedDir | Out-Null
+Copy-Item -LiteralPath $installerPath -Destination (Join-Path $desktopFeedDir $installerFileName) -Force
+Copy-Item -LiteralPath $manifestPath -Destination (Join-Path $desktopFeedDir "latest.json") -Force
 
 Write-Host ""
 Write-Host "Desktop update manifest refreshed:"
 Write-Host "  $manifestPath"
-Write-Host "Installer URL:"
+Write-Host "Desktop update feed:"
+Write-Host "  $desktopFeedDir"
+Write-Host "GitHub backup installer URL:"
 Write-Host "  $installerUrl"

@@ -126,8 +126,7 @@ except Exception:
 
 APP_NAME = "Claim Manager 3.0"
 APP_VERSION = "3.0.1"
-DESKTOP_UPDATE_BRANCH = "desktop-updates"
-DESKTOP_UPDATE_MANIFEST_URL = f"https://api.github.com/repos/fmarin27/ia-app/contents/claim_manager_3/desktop_update/latest.json?ref={DESKTOP_UPDATE_BRANCH}"
+DESKTOP_UPDATE_MANIFEST_URL = "https://api2.luxuryimportsusa.shop/api/desktop-update/latest.json"
 DESKTOP_UPDATE_CONFIG_FILE = APP_DIR / "desktop_update_config.json"
 SECRETS_FILE = APP_DIR / "claims_secrets.json"
 APPTRAK_AUTOMATION_DIR = Path(r"C:\AMobile\automation")

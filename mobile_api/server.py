@@ -27,6 +27,7 @@ except Exception:
     PdfReader = None
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("CLAIM_MANAGER_MOBILE_API_PORT", "8011"))
+DESKTOP_UPDATE_DIR = APP_DIR / "Releases" / "desktop_update_feed"
 IGNORED_FILE_NAMES = {"desktop.ini", "thumbs.db"}
 PHOTO_EXTENSIONS = {
     ".jpg": "image/jpeg",
@@ -310,6 +311,12 @@ class MobileApiHandler(BaseHTTPRequestHandler):
         if path == "/api/mobile/health":
             self._send_json({"ok": True})
             return
+        if path == "/api/desktop-update/latest.json":
+            self._serve_desktop_update_manifest()
+            return
+        if path.startswith("/api/desktop-update/files/"):
+            self._serve_desktop_update_file(path.removeprefix("/api/desktop-update/files/"))
+            return
         if path == "/api/mobile/dashboard":
             self._serve_dashboard()
             return
@@ -435,6 +442,33 @@ class MobileApiHandler(BaseHTTPRequestHandler):
             "records": [self._serialize_claim_summary(claim, base_url) for claim in claims],
         }
         self._send_json(payload)
+
+    def _serve_desktop_update_manifest(self) -> None:
+        manifest_path = DESKTOP_UPDATE_DIR / "latest.json"
+        if not manifest_path.exists():
+            self._send_json({"error": "Desktop update manifest not found."}, status=404)
+            return
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            self._send_json({"error": f"Desktop update manifest is invalid: {exc}"}, status=500)
+            return
+        installer_file = clean_text(payload.get("installer_file"))
+        if installer_file:
+            payload["installer_url"] = f"{self._request_base_url()}/api/desktop-update/files/{quote(installer_file)}"
+        self._send_json(payload)
+
+    def _serve_desktop_update_file(self, file_name: str) -> None:
+        safe_name = Path(unquote(clean_text(file_name))).name
+        if not safe_name:
+            self._send_json({"error": "Desktop update file not found."}, status=404)
+            return
+        file_path = DESKTOP_UPDATE_DIR / safe_name
+        if not file_path.exists() or not file_path.is_file():
+            self._send_json({"error": "Desktop update file not found."}, status=404)
+            return
+        content_type, _ = mimetypes.guess_type(file_path.name)
+        self._serve_path(file_path, filename=file_path.name, content_type=content_type or "application/octet-stream")
 
     def _serve_claim_detail(self, query: str) -> None:
         params = parse_qs(query)
