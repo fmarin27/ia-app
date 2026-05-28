@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import re
 import shutil
@@ -40,6 +41,9 @@ def _runtime_app_dir() -> Path:
 APP_DIR = _runtime_app_dir()
 CLAIM_MANAGER_DIR = APP_DIR / "claim_manager_3" if (APP_DIR / "claim_manager_3").exists() else Path(__file__).resolve().parent
 VENDOR_DIR = CLAIM_MANAGER_DIR / "_vendor"
+claim_manager_path = str(CLAIM_MANAGER_DIR)
+if claim_manager_path not in sys.path:
+    sys.path.insert(0, claim_manager_path)
 if VENDOR_DIR.exists():
     vendor_path = str(VENDOR_DIR)
     if vendor_path not in sys.path:
@@ -54,6 +58,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDateEdit,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -83,6 +88,7 @@ from PySide6.QtWidgets import (
 )
 
 from data_access import (
+    DATA_FILE,
     BodyShopEntry,
     ClaimToolContact,
     ClaimToolFile,
@@ -125,10 +131,13 @@ except Exception:
 
 
 APP_NAME = "Claim Manager 3.0"
-APP_VERSION = "3.0.1"
+APP_VERSION = "3.0.9"
+DATA_DIR = DATA_FILE.parent
 DESKTOP_UPDATE_MANIFEST_URL = "https://api2.luxuryimportsusa.shop/api/desktop-update/latest.json"
-DESKTOP_UPDATE_CONFIG_FILE = APP_DIR / "desktop_update_config.json"
-SECRETS_FILE = APP_DIR / "claims_secrets.json"
+DESKTOP_UPDATE_CONFIG_FILE = DATA_DIR / "desktop_update_config.json"
+SECRETS_FILE = DATA_DIR / "claims_secrets.json"
+LEGACY_DESKTOP_UPDATE_CONFIG_FILE = APP_DIR / "desktop_update_config.json"
+LEGACY_SECRETS_FILE = APP_DIR / "claims_secrets.json"
 APPTRAK_AUTOMATION_DIR = Path(r"C:\AMobile\automation")
 APPTRAK_IMPORT_BAT = APPTRAK_AUTOMATION_DIR / "Run-AppTrakImport.bat"
 APPTRAK_EXE = Path(r"C:\AMobile\app\apptrak.exe")
@@ -136,7 +145,8 @@ APPTRAK_DBF_DIR = Path(r"C:\AMobile\dbf")
 APPTRAK_DOCS_DIR = Path(r"C:\AMobile\docs")
 APPTRAK_PICS_DIR = Path(r"C:\AMobile\pics")
 REFRESH_SCAN_HELPER = CLAIM_MANAGER_DIR / "refresh_scan_helper.py"
-AUTOSOURCE_PDA_TEMPLATE = Path(r"C:\Users\ferna\Downloads\Autosource_PDA_Sub_Level.pdf")
+AUTOSOURCE_PDA_TEMPLATE_NAME = "Autosource_PDA_Sub_Level.pdf"
+CRAWFORD_COVER_SHEET_TEMPLATE_NAME = "Crawford cover sheet.pdf"
 OFFICE_UPDATE_EMAIL_FROM = "fernandomarin27@gmail.com"
 OFFICE_UPDATE_EMAIL_TO = "ldellacorte@duhamels.com"
 OFFICE_UPDATE_EMAIL_CC = "joe@lasalallc.com, dnoone@duhamels.com"
@@ -147,11 +157,12 @@ OFFICE_RMC_EMAIL_TO = "gferreira@duhamels.com"
 OFFICE_SUPPLEMENT_EMAIL_TO = "ldellacorte@duhamels.com"
 OFFICE_SUPPLEMENT_EMAIL_SUBJECT = "Supplement request"
 ROUTE_HOME_ADDRESS = "5 Richlee Rd, Norwalk, CT 06851"
-PAYROLL_OUTPUT_DIR = APP_DIR / "Payroll"
+PAYROLL_OUTPUT_DIR = DATA_DIR / "Payroll"
 CLAIM_TABLE_HEADERS = ["Claim ID", "Customer", "Insurance", "Vehicle", "Shop", "Town", "Date Of Loss", "Status"]
 OPEN_CLAIM_TABLE_HEADERS = CLAIM_TABLE_HEADERS + ["Progress"]
-OFFICE_TABLE_HEADERS = ["Claim ID", "Customer", "Shop", "Inspection When", "Progress", "Additional Notes"]
-REPORT_TABLE_HEADERS = ["Closed Date", "Claim ID", "Customer", "Insurance", "Type"]
+OFFICE_TABLE_HEADERS = ["Claim ID", "Customer", "Type", "Shop", "Inspection When", "Progress", "Additional Notes"]
+OFFICE_UPDATE_SELECTION_HEADERS = ["Claim ID", "Customer", "Type", "Shop", "Inspection When", "Progress"]
+REPORT_TABLE_HEADERS = ["Closed Date", "Claim ID", "Customer", "Insurance", "Type", "Pay", "Payroll"]
 REPORT_NULL_QDATE = QDate(2000, 1, 1)
 
 
@@ -166,17 +177,51 @@ def _load_desktop_update_config() -> dict[str, object]:
         "channel": "stable",
         "manifest_url": DESKTOP_UPDATE_MANIFEST_URL,
     }
-    if not DESKTOP_UPDATE_CONFIG_FILE.exists():
+    source_path = DESKTOP_UPDATE_CONFIG_FILE if DESKTOP_UPDATE_CONFIG_FILE.exists() else LEGACY_DESKTOP_UPDATE_CONFIG_FILE
+    if not source_path.exists():
         return default_config
     try:
-        raw = json.loads(DESKTOP_UPDATE_CONFIG_FILE.read_text(encoding="utf-8"))
+        raw = json.loads(source_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return default_config
+    if source_path == LEGACY_DESKTOP_UPDATE_CONFIG_FILE and DESKTOP_UPDATE_CONFIG_FILE != LEGACY_DESKTOP_UPDATE_CONFIG_FILE:
+        try:
+            DESKTOP_UPDATE_CONFIG_FILE.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        except OSError:
+            pass
     config = {**default_config, **raw}
     config["enabled"] = bool(config.get("enabled", True))
     config["channel"] = str(config.get("channel", "") or "stable").strip() or "stable"
     config["manifest_url"] = str(config.get("manifest_url", "") or DESKTOP_UPDATE_MANIFEST_URL).strip() or DESKTOP_UPDATE_MANIFEST_URL
     return config
+
+
+def _load_email_secret_settings() -> dict[str, str]:
+    source_path = SECRETS_FILE if SECRETS_FILE.exists() else LEGACY_SECRETS_FILE
+    payload: dict[str, object] = {}
+    if source_path.exists():
+        try:
+            payload = json.loads(source_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+    return {
+        "sender_email": str(payload.get("office_update_sender_email") or payload.get("sender_email") or "").strip(),
+        "app_password": str(payload.get("office_update_app_password") or "").strip(),
+    }
+
+
+def _save_email_secret_settings(sender_email: str, app_password: str) -> None:
+    source_path = SECRETS_FILE if SECRETS_FILE.exists() else LEGACY_SECRETS_FILE
+    payload: dict[str, object] = {}
+    if source_path.exists():
+        try:
+            payload = json.loads(source_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+    payload["office_update_sender_email"] = sender_email.strip()
+    payload["office_update_app_password"] = app_password.strip()
+    SECRETS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SECRETS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 class RecordEditorDialog(QDialog):
@@ -517,7 +562,9 @@ class WizardDialog(QDialog):
         self.accept()
 
     def values(self) -> dict[str, str]:
-        return dict(self._answers)
+        self._read_current_value()
+        field_keys = [field[0] for field in self._fields]
+        return {key: str(self._answers.get(key, "") or "").strip() for key in field_keys}
 
     def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
         if event.type() == event.Type.KeyPress and event.key() in (Qt.Key_Return, Qt.Key_Enter):
@@ -534,6 +581,97 @@ class WizardDialog(QDialog):
     def moveEvent(self, event) -> None:  # type: ignore[override]
         self.__class__._last_position = self.pos()
         super().moveEvent(event)
+
+
+class PayrollAdjustmentDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget | None,
+        claim: ClaimView,
+        *,
+        base_pay: float,
+        total_loss_pay: float,
+        excluded: bool,
+        note: str,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Payroll Adjustment")
+        self.setModal(True)
+        self.resize(440, 340)
+        self.setMinimumSize(400, 300)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        title = QLabel(f"{claim.claim_id} - {claim.display_customer}")
+        title.setObjectName("sectionTitle")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(10)
+
+        self.base_pay_input = QDoubleSpinBox()
+        self.base_pay_input.setRange(0.0, 9999.0)
+        self.base_pay_input.setDecimals(2)
+        self.base_pay_input.setPrefix("$")
+        self.base_pay_input.setSingleStep(1.0)
+        self.base_pay_input.setValue(max(base_pay, 0.0))
+        form.addRow("Base Pay", self.base_pay_input)
+
+        self.total_loss_pay_input = QDoubleSpinBox()
+        self.total_loss_pay_input.setRange(0.0, 9999.0)
+        self.total_loss_pay_input.setDecimals(2)
+        self.total_loss_pay_input.setPrefix("$")
+        self.total_loss_pay_input.setSingleStep(1.0)
+        self.total_loss_pay_input.setValue(max(total_loss_pay, 0.0))
+        form.addRow("Total Loss Add-On", self.total_loss_pay_input)
+
+        self.exclude_checkbox = QCheckBox("Exclude this claim from payroll")
+        self.exclude_checkbox.setChecked(excluded)
+        form.addRow("", self.exclude_checkbox)
+
+        layout.addLayout(form)
+
+        note_label = QLabel("Payroll Note (shows at bottom of PDF)")
+        note_label.setObjectName("workspaceStripTitle")
+        layout.addWidget(note_label)
+
+        self.note_input = QTextEdit()
+        self.note_input.setMinimumHeight(92)
+        self.note_input.setPlainText(note or "")
+        layout.addWidget(self.note_input)
+
+        self.total_label = QLabel("")
+        self.total_label.setObjectName("detailValue")
+        layout.addWidget(self.total_label)
+
+        self.base_pay_input.valueChanged.connect(self._refresh_total)
+        self.total_loss_pay_input.valueChanged.connect(self._refresh_total)
+        self.exclude_checkbox.toggled.connect(self._refresh_total)
+        self._refresh_total()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _refresh_total(self) -> None:
+        if self.exclude_checkbox.isChecked():
+            self.total_label.setText("This claim will be excluded from payroll.")
+            return
+        total = self.base_pay_input.value() + self.total_loss_pay_input.value()
+        self.total_label.setText(f"Payroll Total: ${total:,.2f}")
+
+    def values(self) -> tuple[float, float, bool, str]:
+        return (
+            float(self.base_pay_input.value()),
+            float(self.total_loss_pay_input.value()),
+            bool(self.exclude_checkbox.isChecked()),
+            self.note_input.toPlainText().strip(),
+        )
 
 
 class AppTrakWorkerSignals(QObject):
@@ -581,9 +719,25 @@ class ClaimsDashboard(QMainWindow):
         self.resize(1440, 900)
         self.setMinimumSize(1180, 760)
         self._build_ui()
+        QTimer.singleShot(0, self._ensure_window_visible)
         self._load_claims()
         if getattr(sys, "frozen", False) and bool(self.desktop_update_config.get("enabled", True)):
             QTimer.singleShot(1500, self._check_for_desktop_updates_on_launch)
+
+    def _ensure_window_visible(self) -> None:
+        frame = self.frameGeometry()
+        screens = QApplication.screens()
+        if not screens:
+            return
+
+        if any(screen.availableGeometry().intersects(frame) for screen in screens):
+            return
+
+        primary = QApplication.primaryScreen() or screens[0]
+        available = primary.availableGeometry()
+        x = available.x() + max(0, (available.width() - self.width()) // 2)
+        y = available.y() + max(0, (available.height() - self.height()) // 2)
+        self.move(x, y)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -682,14 +836,10 @@ class ClaimsDashboard(QMainWindow):
         self.refresh_scan_button.clicked.connect(self._run_refresh_scan)
         search_layout.addWidget(self.refresh_scan_button, 0)
 
-        self.check_apptrak_button = QPushButton("Check AppTrak")
-        self.check_apptrak_button.clicked.connect(self.run_apptrak_import_now)
-        search_layout.addWidget(self.check_apptrak_button, 0)
-
         controls_row.addWidget(search_wrap, 0, Qt.AlignCenter)
         controls_row.addStretch(1)
 
-        self.apptrak_status_label = QLabel("AppTrak import ready. Manual check only.")
+        self.apptrak_status_label = QLabel("Ready.")
         self.apptrak_status_label.setObjectName("workspaceStripHint")
         self.apptrak_status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         outer.addWidget(self.apptrak_status_label, 0, Qt.AlignRight)
@@ -781,11 +931,31 @@ class ClaimsDashboard(QMainWindow):
         self.open_table = self._build_claim_table(headers=OPEN_CLAIM_TABLE_HEADERS)
         self.closed_table = self._build_claim_table()
         self.office_table = self._build_claim_table(headers=OFFICE_TABLE_HEADERS)
+        self.office_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.office_update_table = QTableWidget(0, len(OFFICE_UPDATE_SELECTION_HEADERS))
+        self.office_update_table.setHorizontalHeaderLabels(OFFICE_UPDATE_SELECTION_HEADERS)
+        self.office_update_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.office_update_table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.office_update_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.office_update_table.verticalHeader().setVisible(False)
+        self.office_update_table.setAlternatingRowColors(True)
+        self.office_update_table.setWordWrap(False)
+        self.office_update_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.office_update_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.office_update_table.horizontalHeader().setStretchLastSection(False)
+        self.office_update_table.horizontalHeader().setSectionsMovable(True)
+        for index in range(len(OFFICE_UPDATE_SELECTION_HEADERS)):
+            self.office_update_table.horizontalHeader().setSectionResizeMode(index, QHeaderView.Interactive)
+        self._set_custom_widths(self.office_update_table, [120, 190, 110, 200, 140, 260])
+        self.office_update_table.itemSelectionChanged.connect(
+            lambda current_table=self.office_update_table: self._handle_table_selection(current_table)
+        )
+        self.office_update_claim_keys: list[str] = []
         self.reports_table = self._build_reports_table()
         self.office_sort_column = "Claim ID"
         self.office_sort_order = Qt.AscendingOrder
 
-        self._set_custom_widths(self.office_table, [125, 180, 170, 140, 240, 280])
+        self._set_custom_widths(self.office_table, [125, 180, 110, 170, 140, 240, 280])
 
         self.tab_stack.addWidget(self._wrap_table(self.all_table))
         self.tab_stack.addWidget(self._wrap_table(self.open_table))
@@ -832,6 +1002,21 @@ class ClaimsDashboard(QMainWindow):
         claim_id_row.addWidget(self.claim_id_value, 0)
         claim_id_row.addStretch(1)
         detail_layout.addLayout(claim_id_row)
+
+        claim_type_row = QHBoxLayout()
+        claim_type_row.setSpacing(10)
+        claim_type_label = QLabel("Claim Type")
+        claim_type_label.setObjectName("detailLabel")
+        self.claim_type_input = QComboBox()
+        self.claim_type_input.addItems(["Original", "Supplement", "Total Loss", "Supplement Total Loss"])
+        self.claim_type_input.setObjectName("detailSelectInput")
+        self.claim_type_input.setMinimumHeight(36)
+        self.claim_type_input.setMinimumWidth(170)
+        self.claim_type_input.setMaximumWidth(190)
+        claim_type_row.addWidget(claim_type_label, 0)
+        claim_type_row.addWidget(self.claim_type_input, 0)
+        claim_type_row.addStretch(1)
+        detail_layout.addLayout(claim_type_row)
 
         form = QGridLayout()
         form.setContentsMargins(0, 2, 0, 0)
@@ -993,7 +1178,7 @@ class ClaimsDashboard(QMainWindow):
             self.library_button.setChecked(is_library)
             self.library_button.setText(tab_label if is_library else "Library")
             self.library_button.blockSignals(False)
-        full_width_tabs = {"Reports", "Route Planner", "Claim Tools", "Body Shops", "Insurance Companies"}
+        full_width_tabs = {"Reports", "Route Planner", "Claim Tools", "Body Shops", "Insurance Companies", "Office Update"}
         show_right = tab_label not in full_width_tabs
         self.right_panel.setVisible(show_right)
         if show_right:
@@ -1046,7 +1231,7 @@ class ClaimsDashboard(QMainWindow):
         table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         table.itemSelectionChanged.connect(lambda current_table=table: self._handle_table_selection(current_table))
-        table.cellDoubleClicked.connect(lambda row, column, current_table=table: self._handle_claim_table_double_click(current_table, row, column))
+        table.cellDoubleClicked.connect(self._handle_reports_table_double_click)
         table.setContextMenuPolicy(Qt.CustomContextMenu)
         table.customContextMenuRequested.connect(lambda pos, current_table=table: self._show_claim_context_menu(current_table, pos))
         header = table.horizontalHeader()
@@ -1055,7 +1240,7 @@ class ClaimsDashboard(QMainWindow):
         header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         for index in range(len(REPORT_TABLE_HEADERS)):
             header.setSectionResizeMode(index, QHeaderView.Interactive)
-        self._set_custom_widths(table, [120, 120, 190, 220, 110])
+        self._set_custom_widths(table, [120, 120, 190, 220, 110, 100, 110])
         return table
 
     def _set_table_column_widths(self, table: QTableWidget, include_office: bool = False) -> None:
@@ -1151,12 +1336,13 @@ class ClaimsDashboard(QMainWindow):
         else:
             self.office_sort_column = column_name
             self.office_sort_order = Qt.AscendingOrder
-        self._populate_office_tables(self.filtered_open)
+        self._populate_office_tables()
 
     def _office_sort_value(self, claim: ClaimView, column_name: str) -> str:
         mapping = {
             "Claim ID": claim.claim_id,
             "Customer": claim.display_customer,
+            "Type": claim.claim_type or "Original",
             "Shop": claim.shop_name,
             "Inspection When": claim.office_appt_when,
             "Progress": claim.office_progress_status or "No update",
@@ -1164,12 +1350,122 @@ class ClaimsDashboard(QMainWindow):
         }
         return (mapping.get(column_name, "") or "").lower()
 
-    def _populate_office_tables(self, claims: list[ClaimView]) -> None:
-        sorted_claims = sorted(
+    def _office_claim_matches_search(self, claim: ClaimView, search: str) -> bool:
+        if not search:
+            return True
+        haystack = " ".join(
+            [
+                claim.claim_id,
+                claim.display_customer,
+                claim.claim_type or "Original",
+                claim.shop_name,
+                claim.insurance_company,
+                claim.claim_number,
+                claim.office_progress_status,
+                claim.office_additional_notes,
+            ]
+        ).lower()
+        return search in haystack
+
+    def _get_claims_for_office_update(self, *, open_only: bool = False) -> list[ClaimView]:
+        claims = list(self.filtered_open)
+        include_closed = (
+            not open_only
+            and hasattr(self, "office_include_closed_checkbox")
+            and self.office_include_closed_checkbox.isChecked()
+        )
+        if include_closed:
+            claims.extend(self.filtered_closed)
+
+        search = ""
+        if hasattr(self, "office_search_input"):
+            search = self.office_search_input.text().strip().lower()
+        if search:
+            claims = [claim for claim in claims if self._office_claim_matches_search(claim, search)]
+
+        return sorted(
             claims,
             key=lambda claim: self._office_sort_value(claim, self.office_sort_column),
             reverse=self.office_sort_order == Qt.DescendingOrder,
         )
+
+    def _refresh_office_update_view(self) -> None:
+        self._populate_office_tables()
+
+    def _populate_office_update_selection_table(self) -> None:
+        selected_claims = [
+            claim for claim in self.claims
+            if claim.key in self.office_update_claim_keys
+        ]
+        selected_claims.sort(key=lambda claim: self.office_update_claim_keys.index(claim.key))
+        current_key = self.current_claim.key if self.current_claim else None
+
+        self.office_update_table.blockSignals(True)
+        self.office_update_table.setRowCount(len(selected_claims))
+        for row, claim in enumerate(selected_claims):
+            values = [
+                claim.claim_id,
+                claim.display_customer,
+                claim.claim_type or "Original",
+                claim.shop_name,
+                claim.office_appt_when or "-",
+                claim.office_progress_status or "No update",
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value or "-")
+                item.setData(Qt.UserRole, claim.key)
+                item.setToolTip(value or "-")
+                self.office_update_table.setItem(row, col, item)
+        self._set_custom_widths(self.office_update_table, [120, 190, 110, 200, 140, 260])
+        self.office_update_table.clearSelection()
+        if selected_claims:
+            target_row = 0
+            if current_key:
+                for index, claim in enumerate(selected_claims):
+                    if claim.key == current_key:
+                        target_row = index
+                        break
+            self.office_update_table.selectRow(target_row)
+        self.office_update_table.blockSignals(False)
+        if selected_claims:
+            self._handle_table_selection(self.office_update_table)
+
+    def _add_selected_claims_to_office_update(self) -> None:
+        rows = sorted({item.row() for item in self.office_table.selectedItems()})
+        added = False
+        for row in rows:
+            claim = self._claim_from_table_row(self.office_table, row)
+            if not claim:
+                continue
+            if claim.key not in self.office_update_claim_keys:
+                self.office_update_claim_keys.append(claim.key)
+                added = True
+        if added:
+            self._populate_office_update_selection_table()
+
+    def _remove_selected_claims_from_office_update(self) -> None:
+        rows = sorted({item.row() for item in self.office_update_table.selectedItems()}, reverse=True)
+        if not rows:
+            return
+        for row in rows:
+            claim = self._claim_from_table_row(self.office_update_table, row)
+            if not claim:
+                continue
+            self.office_update_claim_keys = [key for key in self.office_update_claim_keys if key != claim.key]
+        self._populate_office_update_selection_table()
+
+    def _clear_office_update_claims(self) -> None:
+        self.office_update_claim_keys = []
+        self._populate_office_update_selection_table()
+
+    def _populate_office_tables(self) -> None:
+        sorted_claims = self._get_claims_for_office_update()
+        if hasattr(self, "office_table_title"):
+            self.office_table_title.setText(
+                "Open + Closed Claims"
+                if hasattr(self, "office_include_closed_checkbox") and self.office_include_closed_checkbox.isChecked()
+                else "Open Claims"
+            )
 
         self.office_table.blockSignals(True)
         self.office_table.setSortingEnabled(False)
@@ -1179,6 +1475,7 @@ class ClaimsDashboard(QMainWindow):
             values = [
                 claim.claim_id,
                 claim.display_customer,
+                claim.claim_type or "Original",
                 claim.shop_name,
                 claim.office_appt_when,
                 claim.office_progress_status or "No update",
@@ -1189,7 +1486,7 @@ class ClaimsDashboard(QMainWindow):
                 item = QTableWidgetItem(value or "-")
                 item.setData(Qt.UserRole, claim.key)
                 item.setToolTip(value or "-")
-                if col >= 4:
+                if col >= 5:
                     font = item.font()
                     font.setBold(True)
                     item.setFont(font)
@@ -1197,12 +1494,13 @@ class ClaimsDashboard(QMainWindow):
 
         self._auto_size_columns_with_bounds(
             self.office_table,
-            [100, 150, 150, 130, 220, 240],
-            [170, 260, 230, 200, 340, 420],
+            [100, 150, 100, 150, 130, 220, 240],
+            [170, 260, 140, 230, 200, 340, 420],
         )
         self._apply_office_sort_indicator()
         self.office_table.setSortingEnabled(True)
         self.office_table.blockSignals(False)
+        self._populate_office_update_selection_table()
 
     def _wrap_table(self, table: QTableWidget) -> QWidget:
         wrapper = QWidget()
@@ -1217,42 +1515,62 @@ class ClaimsDashboard(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
-        office_splitter = QSplitter(Qt.Vertical)
+        office_splitter = QSplitter(Qt.Horizontal)
         office_splitter.setChildrenCollapsible(False)
         office_splitter.setObjectName("officeSplitter")
         layout.addWidget(office_splitter, 1)
 
         table_card = QFrame()
         table_card.setObjectName("card")
+        table_card.setMinimumWidth(620)
         table_layout = QVBoxLayout(table_card)
         table_layout.setContentsMargins(18, 12, 18, 14)
         table_layout.setSpacing(6)
         office_splitter.addWidget(table_card)
 
-        table_title = QLabel("Open Claims")
-        table_title.setObjectName("sectionTitle")
-        table_layout.addWidget(table_title)
+        table_header = QHBoxLayout()
+        table_header.setSpacing(10)
+        self.office_table_title = QLabel("Open Claims")
+        self.office_table_title.setObjectName("sectionTitle")
+        table_header.addWidget(self.office_table_title)
+        table_header.addStretch(1)
+        self.office_include_closed_checkbox = QCheckBox("Include Closed Claims")
+        self.office_include_closed_checkbox.toggled.connect(self._refresh_office_update_view)
+        table_header.addWidget(self.office_include_closed_checkbox)
+        table_layout.addLayout(table_header)
+
+        self.office_search_input = QLineEdit()
+        self.office_search_input.setPlaceholderText("Search claim ID, customer, shop, insurance...")
+        self.office_search_input.textChanged.connect(self._refresh_office_update_view)
+        table_layout.addWidget(self.office_search_input)
 
         self.office_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.office_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         table_layout.addWidget(self.office_table, 1)
 
-        lower_row = QHBoxLayout()
-        lower_row.setSpacing(0)
-        lower_wrapper = QWidget()
-        lower_wrapper.setMinimumHeight(220)
-        lower_wrapper.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-        lower_wrapper.setLayout(lower_row)
-        office_splitter.addWidget(lower_wrapper)
-        office_splitter.setSizes([820, 40])
+        office_actions_row = QHBoxLayout()
+        office_actions_row.setSpacing(8)
+        self.office_add_selected_button = QPushButton("Add Selected To Update")
+        self.office_add_selected_button.setObjectName("compactActionButton")
+        self.office_add_selected_button.clicked.connect(self._add_selected_claims_to_office_update)
+        office_actions_row.addWidget(self.office_add_selected_button)
+        self.office_clear_selection_button = QPushButton("Clear Update List")
+        self.office_clear_selection_button.setObjectName("compactActionButton")
+        self.office_clear_selection_button.clicked.connect(self._clear_office_update_claims)
+        office_actions_row.addWidget(self.office_clear_selection_button)
+        office_actions_row.addStretch(1)
+        table_layout.addLayout(office_actions_row)
 
         office_card = QFrame()
         office_card.setObjectName("card")
-        office_card.setMinimumHeight(220)
+        office_card.setMinimumWidth(600)
         office_layout = QVBoxLayout(office_card)
-        office_layout.setContentsMargins(10, 8, 10, 16)
-        office_layout.setSpacing(6)
-        lower_row.addWidget(office_card, 1)
+        office_layout.setContentsMargins(14, 12, 14, 16)
+        office_layout.setSpacing(8)
+        office_splitter.addWidget(office_card)
+        office_splitter.setStretchFactor(0, 3)
+        office_splitter.setStretchFactor(1, 2)
+        office_splitter.setSizes([1080, 760])
 
         office_title_row = QHBoxLayout()
         office_title_row.setContentsMargins(0, 0, 0, 6)
@@ -1262,24 +1580,42 @@ class ClaimsDashboard(QMainWindow):
         office_title_row.addWidget(office_title)
         office_title_row.addStretch(1)
 
+        office_actions_top = QHBoxLayout()
+        office_actions_top.setContentsMargins(0, 0, 0, 0)
+        office_actions_top.setSpacing(10)
+
         self.office_preview_button = QPushButton("Preview PDF")
         self.office_preview_button.setObjectName("compactActionButton")
         self.office_preview_button.clicked.connect(self._preview_office_update_pdf)
-        office_title_row.addWidget(self.office_preview_button, 0, Qt.AlignRight)
+        office_actions_top.addWidget(self.office_preview_button)
 
         self.office_email_button = QPushButton("Email Office Update")
         self.office_email_button.setObjectName("compactActionButton")
         self.office_email_button.clicked.connect(self._email_office_update_pdf)
-        office_title_row.addWidget(self.office_email_button, 0, Qt.AlignRight)
+        office_actions_top.addWidget(self.office_email_button)
 
         self.office_uninspected_button = QPushButton("Email Uninspected Only")
         self.office_uninspected_button.setObjectName("compactActionButton")
         self.office_uninspected_button.clicked.connect(self._email_uninspected_only_to_self)
-        office_title_row.addWidget(self.office_uninspected_button, 0, Qt.AlignRight)
+        office_actions_top.addWidget(self.office_uninspected_button)
+        office_actions_top.addStretch(1)
+
+        selected_claims_header = QHBoxLayout()
+        selected_claims_header.setSpacing(8)
+        selected_claims_label = QLabel("Claims On This Update")
+        selected_claims_label.setObjectName("detailLabel")
+        selected_claims_header.addWidget(selected_claims_label)
+        selected_claims_header.addStretch(1)
+        self.office_remove_selected_button = QPushButton("Remove Selected")
+        self.office_remove_selected_button.setObjectName("compactActionButton")
+        self.office_remove_selected_button.clicked.connect(self._remove_selected_claims_from_office_update)
+        selected_claims_header.addWidget(self.office_remove_selected_button, 0, Qt.AlignRight)
 
         office_form = QFormLayout()
         office_form.setHorizontalSpacing(8)
         office_form.setVerticalSpacing(6)
+        self.office_claim_type_input = QComboBox()
+        self.office_claim_type_input.addItems(["Original", "Supplement", "Total Loss", "Supplement Total Loss"])
         self.office_progress_input = QComboBox()
         self.office_progress_input.addItems(
             [
@@ -1288,18 +1624,23 @@ class ClaimsDashboard(QMainWindow):
                 "Appointment Scheduled",
                 "Seen - Need To Write",
                 "Written - Under Review",
+                "Done",
+                "Sent Thru AppTrak",
                 "Supplement - Waiting For Paperwork",
                 "Waiting For Paperwork",
             ]
         )
         self.office_appt_input = QLineEdit()
+        self.office_claim_type_input.setObjectName("officeCompactInput")
         self.office_progress_input.setObjectName("officeCompactInput")
         self.office_appt_input.setObjectName("officeCompactInput")
+        self.office_claim_type_input.setMaximumHeight(28)
         self.office_progress_input.setMaximumHeight(28)
         self.office_appt_input.setMaximumHeight(28)
         self.office_notes_input = QTextEdit()
         self.office_notes_input.setMinimumHeight(48)
         self.office_notes_input.setMaximumHeight(64)
+        office_form.addRow("Claim Type", self.office_claim_type_input)
         office_form.addRow("Progress", self.office_progress_input)
         office_form.addRow("Date Of Inspection", self.office_appt_input)
         office_form.addRow("Additional Notes", self.office_notes_input)
@@ -1309,8 +1650,16 @@ class ClaimsDashboard(QMainWindow):
         self.save_office_button.setFixedHeight(24)
         self.save_office_button.setFixedWidth(230)
         self.save_office_button.clicked.connect(self._save_office_update)
-        office_title_row.addWidget(self.save_office_button, 0, Qt.AlignRight)
+        office_actions_bottom = QHBoxLayout()
+        office_actions_bottom.setContentsMargins(0, 0, 0, 0)
+        office_actions_bottom.setSpacing(10)
+        office_actions_bottom.addWidget(self.save_office_button)
+        office_actions_bottom.addStretch(1)
         office_layout.addLayout(office_title_row)
+        office_layout.addLayout(office_actions_top)
+        office_layout.addLayout(selected_claims_header)
+        office_layout.addWidget(self.office_update_table, 1)
+        office_layout.addLayout(office_actions_bottom)
         office_layout.addLayout(office_form)
         office_layout.addSpacing(4)
 
@@ -1471,7 +1820,7 @@ class ClaimsDashboard(QMainWindow):
         email_header.addWidget(copy_email_button)
         email_layout.addLayout(email_header)
 
-        email_help = QLabel("Edit the addresses used by each outgoing email flow. Leave a field blank to fall back to the built-in default.")
+        email_help = QLabel("Edit the addresses used by each outgoing email flow. You can also store the sender Gmail and app password on this PC so email actions use that machine's account.")
         email_help.setObjectName("workspaceStripHint")
         email_help.setWordWrap(True)
         email_layout.addWidget(email_help)
@@ -1485,7 +1834,13 @@ class ClaimsDashboard(QMainWindow):
         review_to_input = QLineEdit(self._office_review_email_to())
         rmc_to_input = QLineEdit(self._office_rmc_email_to())
         supplement_to_input = QLineEdit(self._office_supplement_email_to())
+        secret_settings = _load_email_secret_settings()
+        sender_email_input = QLineEdit(secret_settings.get("sender_email") or OFFICE_UPDATE_EMAIL_FROM)
+        sender_app_password_input = QLineEdit(secret_settings.get("app_password") or "")
+        sender_app_password_input.setEchoMode(QLineEdit.Password)
 
+        email_form.addRow("Sender Gmail", sender_email_input)
+        email_form.addRow("Sender App Password", sender_app_password_input)
         email_form.addRow("Office Update To", office_update_to_input)
         email_form.addRow("Office Update Cc", office_update_cc_input)
         email_form.addRow("Review Email To", review_to_input)
@@ -1550,9 +1905,12 @@ class ClaimsDashboard(QMainWindow):
             new_settings = collect_email_settings()
             self.repo.save_email_settings(new_settings)
             self.settings.update(new_settings)
+            _save_email_secret_settings(sender_email_input.text().strip(), sender_app_password_input.text().strip())
             QMessageBox.information(dialog, APP_NAME, "Email settings saved.")
 
         def reset_email_defaults() -> None:
+            sender_email_input.setText(OFFICE_UPDATE_EMAIL_FROM)
+            sender_app_password_input.setText("")
             office_update_to_input.setText(OFFICE_UPDATE_EMAIL_TO)
             office_update_cc_input.setText(OFFICE_UPDATE_EMAIL_CC)
             review_to_input.setText(OFFICE_REVIEW_EMAIL_TO)
@@ -1840,10 +2198,23 @@ class ClaimsDashboard(QMainWindow):
         list_layout.setSpacing(8)
         body_layout.addWidget(list_card, 0, 1)
 
+        list_header = QHBoxLayout()
+        list_header.setContentsMargins(0, 0, 0, 0)
+        list_header.setSpacing(8)
         list_title = QLabel("Claims In Filter")
         list_title.setObjectName("sectionTitle")
-        list_layout.addWidget(list_title)
+        list_header.addWidget(list_title)
+        list_header.addStretch(1)
+        self.report_edit_pay_button = QPushButton("Edit Selected Pay")
+        self.report_edit_pay_button.setObjectName("compactPrimaryButton")
+        self.report_edit_pay_button.clicked.connect(self._edit_selected_report_claim_payroll)
+        list_header.addWidget(self.report_edit_pay_button)
+        self.report_toggle_exclude_button = QPushButton("Remove From Payroll")
+        self.report_toggle_exclude_button.clicked.connect(self._toggle_selected_report_claim_payroll)
+        list_header.addWidget(self.report_toggle_exclude_button)
+        list_layout.addLayout(list_header)
         list_layout.addWidget(self.reports_table, 1)
+        self._refresh_report_action_buttons()
 
         return wrapper
 
@@ -1855,7 +2226,15 @@ class ClaimsDashboard(QMainWindow):
         picker.setSpecialValueText(empty_text)
         picker.setDate(REPORT_NULL_QDATE)
         picker.setKeyboardTracking(False)
+        self._reset_report_picker_calendar(picker)
         return picker
+
+    def _reset_report_picker_calendar(self, picker: QDateEdit) -> None:
+        today = QDate.currentDate()
+        calendar = picker.calendarWidget()
+        if calendar is not None:
+            calendar.setSelectedDate(today)
+            calendar.setCurrentPage(today.year(), today.month())
 
     def _report_picker_has_value(self, picker: QDateEdit) -> bool:
         return picker.date() != picker.minimumDate()
@@ -2491,9 +2870,53 @@ class ClaimsDashboard(QMainWindow):
                 max-height: 18px;
                 font-size: 9px;
             }
+            QComboBox#detailSelectInput {
+                background: #f7fbff;
+                color: #1b3044;
+                border: 1px solid #cfdae7;
+                border-radius: 13px;
+                padding: 4px 36px 4px 12px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QComboBox#detailSelectInput:hover {
+                border-color: #bccbdd;
+            }
+            QComboBox#detailSelectInput:focus {
+                border: 1px solid #8aa7c5;
+                background: #ffffff;
+            }
+            QComboBox#detailSelectInput::drop-down,
+            QComboBox#officeCompactInput::drop-down {
+                border: none;
+                border-left: 1px solid #d7e2ee;
+                background: #edf4fb;
+                width: 28px;
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                border-top-right-radius: 12px;
+                border-bottom-right-radius: 12px;
+            }
+            QComboBox#detailSelectInput::down-arrow,
+            QComboBox#officeCompactInput::down-arrow {
+                width: 10px;
+                height: 10px;
+            }
+            QComboBox#detailSelectInput QAbstractItemView,
+            QComboBox#officeCompactInput QAbstractItemView {
+                background: #ffffff;
+                color: #182738;
+                border: 1px solid #cfdae7;
+                selection-background-color: #d7e8fb;
+                selection-color: #122131;
+                outline: 0;
+            }
             QComboBox#officeCompactInput, QLineEdit#officeCompactInput {
-                padding: 3px 9px;
+                background: #f9fbfe;
+                padding: 3px 28px 3px 9px;
+                border: 1px solid #d7e0ea;
                 border-radius: 11px;
+                color: #1b3044;
                 font-size: 10px;
             }
             QPushButton#navTabButton {
@@ -2612,16 +3035,9 @@ class ClaimsDashboard(QMainWindow):
         def worker() -> None:
             result: dict[str, object] = {"error": None}
             try:
-                if not REFRESH_SCAN_HELPER.exists():
-                    raise RuntimeError(f"Refresh scan helper was not found:\n{REFRESH_SCAN_HELPER}")
-                subprocess.run(
-                    [sys.executable, str(REFRESH_SCAN_HELPER)],
-                    cwd=str(APP_DIR),
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                )
+                access_issues = self.repo.refresh_scan()
+                if access_issues:
+                    result["access_issues"] = access_issues
             except Exception as exc:
                 result["error"] = str(exc)
             self.refresh_scan_signals.finished.emit(result)
@@ -2640,6 +3056,17 @@ class ClaimsDashboard(QMainWindow):
 
         self._load_claims()
         self.apptrak_status_label.setText("Refresh Scan completed.")
+        access_issues = result.get("access_issues") or []
+        if access_issues:
+            issue_lines = [f"- {value}" for value in list(access_issues)[:10]]
+            if len(access_issues) > 10:
+                issue_lines.append(f"- and {len(access_issues) - 10} more")
+            QMessageBox.warning(
+                self,
+                APP_NAME,
+                "Some claim folders could not be scanned because they were open or unavailable:\n\n"
+                + "\n".join(issue_lines),
+            )
 
     def run_apptrak_import_now(self) -> None:
         self._run_apptrak_import_cycle(manual=True)
@@ -2651,7 +3078,8 @@ class ClaimsDashboard(QMainWindow):
             return
 
         self.apptrak_import_running = True
-        self.check_apptrak_button.setEnabled(False)
+        if hasattr(self, "check_apptrak_button"):
+            self.check_apptrak_button.setEnabled(False)
         self.apptrak_status_label.setText("Running AppTrak import...")
         processed_snapshot = set(self.processed_apptrak_pdfs)
 
@@ -2752,7 +3180,8 @@ class ClaimsDashboard(QMainWindow):
 
     def _finish_apptrak_import_cycle(self, result: dict[str, object]) -> None:
         self.apptrak_import_running = False
-        self.check_apptrak_button.setEnabled(True)
+        if hasattr(self, "check_apptrak_button"):
+            self.check_apptrak_button.setEnabled(True)
 
         manual = bool(result.get("manual"))
         error = str(result.get("error") or "").strip()
@@ -2845,7 +3274,16 @@ class ClaimsDashboard(QMainWindow):
             "title": title,
             "status": "Open",
             "source_path": str(target_folder),
-            "claim_type": "Original",
+            "claim_type": (
+                "Supplement Total Loss"
+                if any(token in title.lower() for token in ("supp", "reinspect", "re-inspection", "reinspection"))
+                and any(token in title.lower() for token in ("total loss", "possible total", "total-loss"))
+                else "Supplement"
+                if any(token in title.lower() for token in ("supp", "reinspect", "re-inspection", "reinspection"))
+                else "Total Loss"
+                if any(token in title.lower() for token in ("total loss", "possible total", "total-loss"))
+                else "Original"
+            ),
             "total_loss": False,
             "updated_at": timestamp,
             "closed_date": "",
@@ -3059,7 +3497,7 @@ class ClaimsDashboard(QMainWindow):
         self._populate_table(self.open_table, self.filtered_open)
         self._populate_table(self.closed_table, self.filtered_closed)
         self._populate_reports()
-        self._populate_office_tables(self.filtered_open)
+        self._populate_office_tables()
         self._populate_workspace()
         self._populate_claim_tools()
         self._populate_body_shops()
@@ -3089,7 +3527,22 @@ class ClaimsDashboard(QMainWindow):
     def _closed_date_for_claim(self, claim: ClaimView) -> datetime | None:
         if claim.status.strip().lower() != "closed":
             return None
-        source_value = (claim.closed_date or claim.updated_at or "").strip()
+        source_value = (claim.closed_date or "").strip()
+        if not source_value:
+            source_path = (claim.source_path or "").strip()
+            folder_match = re.search(r"Claims\s+(\d{1,2})-(\d{1,2})-(\d{2,4})", source_path, re.IGNORECASE)
+            if folder_match:
+                month = int(folder_match.group(1))
+                day = int(folder_match.group(2))
+                year = int(folder_match.group(3))
+                if year < 100:
+                    year += 2000
+                try:
+                    return datetime(year, month, day)
+                except ValueError:
+                    pass
+        if not source_value:
+            source_value = (claim.updated_at or "").strip()
         if not source_value:
             return None
         normalized = source_value.replace("Z", "+00:00")
@@ -3190,19 +3643,29 @@ class ClaimsDashboard(QMainWindow):
         self.reports_table.setRowCount(len(filtered))
         for row, claim in enumerate(filtered):
             closed_date = self._closed_date_for_claim(claim)
+            _, _, total_pay = self._payroll_values_for_claim(claim)
             values = [
                 closed_date.strftime("%Y-%m-%d") if closed_date else "",
                 claim.claim_id,
                 claim.display_customer,
                 claim.insurance_company,
                 claim.claim_type or "-",
+                f"${total_pay:,.2f}",
+                "Excluded" if claim.payroll_excluded else "Included",
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value or "-")
                 item.setData(Qt.UserRole, claim.key)
+                if REPORT_TABLE_HEADERS[col] in {"Pay", "Payroll"}:
+                    item.setToolTip("Double-click to edit payroll pay")
                 self.reports_table.setItem(row, col, item)
-        self._auto_size_columns_with_bounds(self.reports_table, [105, 105, 155, 160, 90], [135, 140, 220, 250, 120])
+        self._auto_size_columns_with_bounds(
+            self.reports_table,
+            [105, 105, 155, 160, 90, 95, 100],
+            [135, 140, 220, 250, 120, 110, 120],
+        )
         self.reports_table.setSortingEnabled(True)
+        self._refresh_report_action_buttons()
 
     def _on_reports_specific_date_changed(self, _value: QDate) -> None:
         self.report_selected_date = ""
@@ -3229,16 +3692,139 @@ class ClaimsDashboard(QMainWindow):
         self.report_selected_date = ""
         self.report_start_input.setDate(REPORT_NULL_QDATE)
         self.report_end_input.setDate(REPORT_NULL_QDATE)
+        self._reset_report_picker_calendar(self.report_start_input)
+        self._reset_report_picker_calendar(self.report_end_input)
         self.report_specific_date_input.blockSignals(True)
         self.report_specific_date_input.setDate(REPORT_NULL_QDATE)
+        self._reset_report_picker_calendar(self.report_specific_date_input)
         self.report_specific_date_input.blockSignals(False)
         self._populate_reports()
 
-    def _payroll_template_path(self) -> Path:
+    def _default_payroll_base_pay(self, claim: ClaimView) -> float:
+        return 25.0 if "supplement" in (claim.claim_type or "").lower() else 57.0
+
+    def _default_payroll_total_loss_pay(self, claim: ClaimView) -> float:
+        return 5.0 if claim.total_loss else 0.0
+
+    def _payroll_values_for_claim(self, claim: ClaimView) -> tuple[float, float, float]:
+        base_pay = claim.payroll_base_pay
+        if base_pay is None:
+            base_pay = self._default_payroll_base_pay(claim)
+        total_loss_pay = claim.payroll_total_loss_pay
+        if total_loss_pay is None:
+            total_loss_pay = self._default_payroll_total_loss_pay(claim)
+        total_pay = float(base_pay) + float(total_loss_pay)
+        return float(base_pay), float(total_loss_pay), float(total_pay)
+
+    def _report_payroll_label(self, claim: ClaimView) -> str:
+        if claim.payroll_excluded:
+            return "Excluded"
+        _, _, total_pay = self._payroll_values_for_claim(claim)
+        return f"${total_pay:,.2f}"
+
+    def _payroll_note_entries(self, claims: list[ClaimView]) -> list[str]:
+        entries: list[str] = []
+        for claim in claims:
+            note = (claim.payroll_note or "").strip()
+            if not note:
+                continue
+            claim_label = (claim.claim_id or claim.claim_number or claim.display_customer or "Claim").strip()
+            entries.append(f"{claim_label}: {note}")
+        return entries
+
+    def _selected_report_claim(self) -> ClaimView | None:
+        if not hasattr(self, "reports_table"):
+            return None
+        row = self.reports_table.currentRow()
+        if row < 0:
+            return None
+        return self._claim_from_table_row(self.reports_table, row)
+
+    def _refresh_report_action_buttons(self) -> None:
+        if not hasattr(self, "report_edit_pay_button") or not hasattr(self, "report_toggle_exclude_button"):
+            return
+        claim = self._selected_report_claim()
+        enabled = claim is not None
+        self.report_edit_pay_button.setEnabled(enabled)
+        self.report_toggle_exclude_button.setEnabled(enabled)
+        if not claim:
+            self.report_toggle_exclude_button.setText("Remove From Payroll")
+            return
+        self.report_toggle_exclude_button.setText("Restore To Payroll" if claim.payroll_excluded else "Remove From Payroll")
+
+    def _edit_selected_report_claim_payroll(self) -> None:
+        claim = self._selected_report_claim()
+        if not claim:
+            QMessageBox.information(self, "Select Claim", "Select a claim in Reports first.")
+            return
+        self._edit_claim_payroll(claim)
+
+    def _edit_claim_payroll(self, claim: ClaimView) -> None:
+        base_pay, total_loss_pay, _ = self._payroll_values_for_claim(claim)
+        dialog = PayrollAdjustmentDialog(
+            self,
+            claim,
+            base_pay=base_pay,
+            total_loss_pay=total_loss_pay,
+            excluded=claim.payroll_excluded,
+            note=claim.payroll_note,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        new_base_pay, new_total_loss_pay, excluded, note = dialog.values()
+        self.repo.update_claim_payroll_settings(
+            claim.key,
+            excluded=excluded,
+            base_pay=new_base_pay,
+            total_loss_pay=new_total_loss_pay,
+            note=note,
+        )
+        self._load_claims()
+        self._reselect_current_claim(claim.key)
+        self._restore_report_table_selection(claim.key)
+
+    def _toggle_selected_report_claim_payroll(self) -> None:
+        claim = self._selected_report_claim()
+        if not claim:
+            QMessageBox.information(self, "Select Claim", "Select a claim in Reports first.")
+            return
+        base_pay, total_loss_pay, _ = self._payroll_values_for_claim(claim)
+        self.repo.update_claim_payroll_settings(
+            claim.key,
+            excluded=not claim.payroll_excluded,
+            base_pay=base_pay,
+            total_loss_pay=total_loss_pay,
+            note=claim.payroll_note,
+        )
+        self._load_claims()
+        self._reselect_current_claim(claim.key)
+        self._restore_report_table_selection(claim.key)
+
+    def _restore_report_table_selection(self, claim_key: str) -> None:
+        if not hasattr(self, "reports_table"):
+            return
+        for row in range(self.reports_table.rowCount()):
+            item = self.reports_table.item(row, 0)
+            if item and item.data(Qt.UserRole) == claim_key:
+                self.reports_table.selectRow(row)
+                self.reports_table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+                break
+        self._refresh_report_action_buttons()
+
+    def _claim_tools_root(self) -> Path:
         claim_tools_folder = str(self.settings.get("claim_tools_folder", "") or "").strip()
         if claim_tools_folder:
-            return Path(claim_tools_folder) / "APPRAISER PAYROLL SPREADSHEET.xlsx"
-        return APP_DIR / "Claim Tools" / "APPRAISER PAYROLL SPREADSHEET.xlsx"
+            return Path(claim_tools_folder)
+        return APP_DIR / "Claim Tools"
+
+    def _payroll_template_path(self) -> Path:
+        return self._claim_tools_root() / "APPRAISER PAYROLL SPREADSHEET.xlsx"
+
+    def _autosource_template_path(self) -> Path:
+        return self._claim_tools_root() / AUTOSOURCE_PDA_TEMPLATE_NAME
+
+    def _crawford_cover_sheet_template_path(self) -> Path:
+        return self._claim_tools_root() / CRAWFORD_COVER_SHEET_TEMPLATE_NAME
 
     def _calculate_payroll(self) -> None:
         if load_workbook is None:
@@ -3272,9 +3858,16 @@ class ClaimsDashboard(QMainWindow):
 
         start_row = 5
         template_end_row = 46
-        exported = filtered
+        exported = [claim for claim in filtered if not claim.payroll_excluded]
+        if not exported:
+            QMessageBox.information(self, "No Payroll Claims", "All claims in the current report filter are excluded from payroll.")
+            return
+        payroll_notes = self._payroll_note_entries(exported)
         total_row = start_row + len(exported)
-        clear_through_row = max(template_end_row + 1, total_row)
+        notes_start_row = total_row + 2 if payroll_notes else total_row + 1
+        notes_end_row = notes_start_row + len(payroll_notes)
+        final_used_row = notes_end_row if payroll_notes else total_row
+        clear_through_row = max(template_end_row + 1, final_used_row)
 
         for row in range(start_row, clear_through_row + 1):
             for col in ("A", "B", "C", "D", "E", "F"):
@@ -3286,11 +3879,12 @@ class ClaimsDashboard(QMainWindow):
             owner_name = (claim.customer_name or claim.title or "").strip()
             if owner_name and owner_name.isupper():
                 owner_name = owner_name.title()
+            base_pay, total_loss_pay, _ = self._payroll_values_for_claim(claim)
             ws[f"A{idx}"] = (claim.claim_id or claim.claim_number or "").strip()
             ws[f"B{idx}"] = (claim.insurance_company or "").strip()
             ws[f"C{idx}"] = owner_name
-            ws[f"D{idx}"] = 25.0 if claim.claim_type == "Supplement" else 57.0
-            ws[f"E{idx}"] = 5.0 if claim.total_loss else None
+            ws[f"D{idx}"] = base_pay
+            ws[f"E{idx}"] = total_loss_pay if total_loss_pay else None
             ws[f"F{idx}"] = f"=D{idx}+E{idx}"
             self._normalize_payroll_row_style(ws, idx)
             ws[f"D{idx}"].number_format = "0.00"
@@ -3301,7 +3895,25 @@ class ClaimsDashboard(QMainWindow):
         self._finalize_payroll_total_row(ws, total_row)
         ws[f"F{total_row}"] = f"=SUM(F{start_row}:F{total_row - 1})"
         ws[f"F{total_row}"].number_format = "0.00"
-        self._configure_payroll_sheet_for_export(ws, total_row)
+        if payroll_notes:
+            notes_heading_row = total_row + 2
+            ws[f"A{notes_heading_row}"] = "Notes:"
+            heading_font = copy(ws["A5"].font)
+            heading_font.bold = True
+            ws[f"A{notes_heading_row}"].font = heading_font
+            ws[f"A{notes_heading_row}"].alignment = copy(ws["A5"].alignment)
+            for offset, note_text in enumerate(payroll_notes, start=1):
+                row = notes_heading_row + offset
+                ws.merge_cells(f"A{row}:F{row}")
+                note_cell = ws[f"A{row}"]
+                note_cell.value = note_text
+                note_alignment = copy(ws["A5"].alignment)
+                note_alignment.wrap_text = True
+                note_cell.alignment = note_alignment
+                note_cell.font = copy(ws["A5"].font)
+                approx_lines = max(1, math.ceil(len(note_text) / 72))
+                ws.row_dimensions[row].height = max(24, approx_lines * 16)
+        self._configure_payroll_sheet_for_export(ws, final_used_row)
 
         PAYROLL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         base_name = f"Fernando pay {end.month}-{end.day}-{end.strftime('%y')}"
@@ -3310,7 +3922,7 @@ class ClaimsDashboard(QMainWindow):
         wb.save(output_path)
 
         try:
-            self._export_workbook_to_pdf(output_path, pdf_path, total_row)
+            self._export_workbook_to_pdf(output_path, pdf_path, final_used_row)
             os.startfile(str(pdf_path))  # type: ignore[attr-defined]
             QMessageBox.information(self, "Payroll Created", f"Saved payroll files:\n{output_path}\n{pdf_path}")
         except Exception as exc:
@@ -3326,6 +3938,10 @@ class ClaimsDashboard(QMainWindow):
             target.border = copy(source.border)
             target.alignment = copy(source.alignment)
             target.protection = copy(source.protection)
+            if col == "C" and not any(
+                side.style for side in (target.border.left, target.border.right, target.border.top, target.border.bottom)
+            ):
+                target.border = copy(ws[f"B{source_row}"].border)
 
     def _normalize_payroll_total_row_style(self, ws, row: int) -> None:
         source_row = 47
@@ -3871,14 +4487,21 @@ class ClaimsDashboard(QMainWindow):
         self._load_claims()
 
     def _handle_table_selection(self, table: QTableWidget) -> None:
+        is_reports_table = hasattr(self, "reports_table") and table is self.reports_table
         row = table.currentRow()
         if row < 0:
+            if is_reports_table:
+                self._refresh_report_action_buttons()
             return
         claim = self._claim_from_table_row(table, row)
         if not claim:
+            if is_reports_table:
+                self._refresh_report_action_buttons()
             return
         self.current_claim = claim
         self._render_claim(claim)
+        if is_reports_table:
+            self._refresh_report_action_buttons()
 
     def _claim_from_table_row(self, table: QTableWidget, row: int) -> ClaimView | None:
         if row < 0:
@@ -3902,7 +4525,16 @@ class ClaimsDashboard(QMainWindow):
         self.current_claim = claim
         self._render_claim(claim)
 
+        is_reports_table = hasattr(self, "reports_table") and table is self.reports_table
         menu = QMenu(self)
+        edit_pay_action = None
+        toggle_payroll_action = None
+        if is_reports_table:
+            edit_pay_action = menu.addAction("Edit Payroll Pay")
+            toggle_payroll_action = menu.addAction(
+                "Restore To Payroll" if claim.payroll_excluded else "Remove From Payroll"
+            )
+            menu.addSeparator()
         open_assign_action = menu.addAction("Open Working Sheet")
         email_assign_action = menu.addAction("Email Assignment Sheet")
         open_folder_action = menu.addAction("Open Claim Folder")
@@ -3925,7 +4557,21 @@ class ClaimsDashboard(QMainWindow):
         copy_customer_action = menu.addAction("Copy Customer")
 
         chosen = menu.exec(table.viewport().mapToGlobal(pos))
-        if chosen == open_assign_action:
+        if edit_pay_action is not None and chosen == edit_pay_action:
+            self._edit_claim_payroll(claim)
+        elif toggle_payroll_action is not None and chosen == toggle_payroll_action:
+            base_pay, total_loss_pay, _ = self._payroll_values_for_claim(claim)
+            self.repo.update_claim_payroll_settings(
+                claim.key,
+                excluded=not claim.payroll_excluded,
+                base_pay=base_pay,
+                total_loss_pay=total_loss_pay,
+                note=claim.payroll_note,
+            )
+            self._load_claims()
+            self._reselect_current_claim(claim.key)
+            self._restore_report_table_selection(claim.key)
+        elif chosen == open_assign_action:
             self._open_assignment_sheet()
         elif chosen == email_assign_action:
             self._email_assignment_sheet()
@@ -3961,8 +4607,9 @@ class ClaimsDashboard(QMainWindow):
         menu.addAction("Default Claim Notes", self._generate_default_claim_notes)
         menu.addAction("Mitchell Total Loss", self._generate_mitchell_total_loss)
         menu.addAction("Autosource PDA Sub Level", self._generate_autosource_pda_sub_level)
+        menu.addAction("Crawford Cover Sheet", self._generate_crawford_cover_sheet)
         menu.addSeparator()
-        tools_root = Path(str(self.settings.get("claim_tools_folder", "") or ""))
+        tools_root = self._claim_tools_root()
         if not tools_root.exists():
             action = menu.addAction("Claim Tools Folder Missing")
             action.setEnabled(False)
@@ -3993,6 +4640,8 @@ class ClaimsDashboard(QMainWindow):
         self.claim_id_value.setText(claim.claim_id or "-")
         for key, widget in self.detail_inputs.items():
             widget.setText(values.get(key, ""))
+        self._set_combo_value(self.claim_type_input, claim.claim_type or "Original")
+        self._set_combo_value(self.office_claim_type_input, claim.claim_type or "Original")
         self._set_combo_value(self.office_progress_input, claim.office_progress_status or "No Contact Yet")
         self.office_appt_input.setText(claim.office_appt_when or "")
         self.office_notes_input.setPlainText(claim.office_additional_notes or "")
@@ -4010,6 +4659,16 @@ class ClaimsDashboard(QMainWindow):
         column_name = header_item.text() if header_item else ""
         if column_name == "Shop":
             self._edit_shop_info_for_claim(claim)
+
+    def _handle_reports_table_double_click(self, row: int, column: int) -> None:
+        claim = self._claim_from_table_row(self.reports_table, row)
+        if not claim:
+            return
+        self.reports_table.selectRow(row)
+        header_item = self.reports_table.horizontalHeaderItem(column)
+        column_name = header_item.text() if header_item else ""
+        if column_name in {"Pay", "Payroll"}:
+            self._edit_claim_payroll(claim)
 
     def _normalize_shop_name(self, value: str) -> str:
         return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
@@ -4660,16 +5319,9 @@ class ClaimsDashboard(QMainWindow):
         ]
         return "\n".join(lines)
 
-    def _get_open_claims_for_office_update(self) -> list[ClaimView]:
-        return sorted(
-            self.filtered_open,
-            key=lambda claim: self._office_sort_value(claim, self.office_sort_column),
-            reverse=self.office_sort_order == Qt.DescendingOrder,
-        )
-
     def _get_uninspected_claims_for_self_copy(self) -> list[ClaimView]:
         records: list[ClaimView] = []
-        for claim in self._get_open_claims_for_office_update():
+        for claim in self._get_claims_for_office_update(open_only=True):
             progress = (claim.office_progress_status or "").strip().lower()
             waiting = (claim.office_waiting_for_paperwork or "").strip().lower()
             if waiting == "yes":
@@ -4678,6 +5330,14 @@ class ClaimsDashboard(QMainWindow):
                 continue
             records.append(claim)
         return records
+
+    def _get_selected_claims_for_office_update(self) -> list[ClaimView]:
+        selected_claims = [
+            claim for claim in self.claims
+            if claim.key in self.office_update_claim_keys
+        ]
+        selected_claims.sort(key=lambda claim: self.office_update_claim_keys.index(claim.key))
+        return selected_claims
 
     def _customer_last_name(self, claim: ClaimView) -> str:
         customer = (claim.customer_name or claim.title or "").strip()
@@ -4721,7 +5381,7 @@ class ClaimsDashboard(QMainWindow):
         if Document is None:
             raise RuntimeError("python-docx is not available.")
 
-        output_dir = APP_DIR / "Office Updates"
+        output_dir = DATA_DIR / "Office Updates"
         output_dir.mkdir(parents=True, exist_ok=True)
         base_name = f"Office Update {datetime.now().strftime('%Y-%m-%d %H-%M')}"
         docx_path = self._unique_destination(output_dir / f"{base_name}.docx")
@@ -4741,7 +5401,7 @@ class ClaimsDashboard(QMainWindow):
                 section.top_margin = Inches(0.4)
                 section.bottom_margin = Inches(0.4)
 
-        columns = ["Job #", "Customer", "Insurance", "Inspection", "Shop", "Progress", "Additional Notes"]
+        columns = ["Job #", "Customer", "Type", "Insurance", "Inspection", "Shop", "Progress", "Additional Notes"]
         table = document.add_table(rows=1, cols=len(columns))
         table.style = "Table Grid"
         for idx, label in enumerate(columns):
@@ -4751,11 +5411,12 @@ class ClaimsDashboard(QMainWindow):
             row = table.add_row().cells
             row[0].text = claim.claim_id or "-"
             row[1].text = claim.display_customer or "-"
-            row[2].text = claim.insurance_company or "-"
-            row[3].text = claim.office_appt_when or "-"
-            row[4].text = claim.shop_name or "-"
-            row[5].text = claim.office_progress_status or "-"
-            row[6].text = claim.office_additional_notes or ""
+            row[2].text = claim.claim_type or "Original"
+            row[3].text = claim.insurance_company or "-"
+            row[4].text = claim.office_appt_when or "-"
+            row[5].text = claim.shop_name or "-"
+            row[6].text = claim.office_progress_status or "-"
+            row[7].text = claim.office_additional_notes or ""
 
         document.save(docx_path)
         self._export_doc_to_pdf(docx_path, pdf_path)
@@ -4770,7 +5431,7 @@ class ClaimsDashboard(QMainWindow):
         if Document is None:
             raise RuntimeError("python-docx is not available.")
 
-        output_dir = APP_DIR / "Office Updates"
+        output_dir = DATA_DIR / "Office Updates"
         output_dir.mkdir(parents=True, exist_ok=True)
         base_name = f"{base_name_prefix} {datetime.now().strftime('%Y-%m-%d %H-%M')}"
         docx_path = self._unique_destination(output_dir / f"{base_name}.docx")
@@ -4794,6 +5455,7 @@ class ClaimsDashboard(QMainWindow):
             "Job #",
             "Claim #",
             "Customer",
+            "Type",
             "Vehicle",
             "Insurance",
             "Address",
@@ -4813,22 +5475,24 @@ class ClaimsDashboard(QMainWindow):
             row[0].text = claim.claim_id or "-"
             row[1].text = claim.claim_number or "-"
             row[2].text = claim.display_customer or "-"
-            row[3].text = claim.vehicle or "-"
-            row[4].text = claim.insurance_company or "-"
-            row[5].text = self._route_default_address(claim) or "-"
-            row[6].text = claim.contact_phone or "-"
-            row[7].text = claim.office_progress_status or "-"
-            row[8].text = claim.assignment_claim_notes or "-"
-            row[9].text = claim.notes or "-"
-            row[10].text = claim.office_additional_notes or ""
+            row[3].text = claim.claim_type or "Original"
+            row[4].text = claim.vehicle or "-"
+            row[5].text = claim.insurance_company or "-"
+            row[6].text = self._route_default_address(claim) or "-"
+            row[7].text = claim.contact_phone or "-"
+            row[8].text = claim.office_progress_status or "-"
+            row[9].text = claim.assignment_claim_notes or "-"
+            row[10].text = claim.notes or "-"
+            row[11].text = claim.office_additional_notes or ""
 
         document.save(docx_path)
         self._export_doc_to_pdf(docx_path, pdf_path)
         return pdf_path
 
     def _send_office_update_email(self, attachment_path: Path) -> None:
+        sender_email, _ = self._get_email_credentials()
         message = EmailMessage()
-        message["From"] = OFFICE_UPDATE_EMAIL_FROM
+        message["From"] = sender_email
         message["To"] = self._office_update_email_to()
         cc_value = self._office_update_email_cc()
         if cc_value:
@@ -4875,23 +5539,23 @@ class ClaimsDashboard(QMainWindow):
         self._send_email_message(message)
 
     def _preview_office_update_pdf(self) -> None:
-        open_claims = self._get_open_claims_for_office_update()
-        if not open_claims:
+        office_claims = self._get_selected_claims_for_office_update() or self._get_claims_for_office_update()
+        if not office_claims:
             QMessageBox.information(self, APP_NAME, "There is no office summary to export.")
             return
         try:
-            pdf_path = self._generate_office_update_pdf(open_claims)
+            pdf_path = self._generate_office_update_pdf(office_claims)
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(pdf_path)))
         except Exception as exc:
             QMessageBox.warning(self, APP_NAME, f"Could not create office update PDF:\n{exc}")
 
     def _email_office_update_pdf(self) -> None:
-        open_claims = self._get_open_claims_for_office_update()
-        if not open_claims:
+        office_claims = self._get_selected_claims_for_office_update() or self._get_claims_for_office_update()
+        if not office_claims:
             QMessageBox.information(self, APP_NAME, "There is no office summary to export.")
             return
         try:
-            pdf_path = self._generate_office_update_pdf(open_claims)
+            pdf_path = self._generate_office_update_pdf(office_claims)
             self._send_office_update_email(pdf_path)
             QMessageBox.information(self, APP_NAME, f"Exported and emailed:\n{pdf_path}")
         except Exception as exc:
@@ -4937,6 +5601,9 @@ class ClaimsDashboard(QMainWindow):
         if not self.current_claim:
             return
         updates = {key: widget.text().strip() for key, widget in self.detail_inputs.items()}
+        claim_type_value = self.claim_type_input.currentText().strip() or "Original"
+        updates["claim_type"] = claim_type_value
+        updates["total_loss"] = "total" in claim_type_value.lower()
         self.repo.update_claim_fields(self.current_claim.key, updates)
         self._load_claims()
         self._reselect_current_claim()
@@ -4946,12 +5613,20 @@ class ClaimsDashboard(QMainWindow):
             return
         previous_appt_when = (self.current_claim.office_appt_when or "").strip()
         progress_value = self.office_progress_input.currentText().strip()
+        claim_type_value = self.office_claim_type_input.currentText().strip() or "Original"
         updates = {
             "office_progress_status": progress_value,
             "office_appt_when": self.office_appt_input.text().strip(),
             "office_waiting_for_paperwork": "Yes" if "waiting for paperwork" in progress_value.lower() else "No",
             "office_additional_notes": self.office_notes_input.toPlainText().strip(),
         }
+        self.repo.update_claim_fields(
+            self.current_claim.key,
+            {
+                "claim_type": claim_type_value,
+                "total_loss": "total" in claim_type_value.lower(),
+            },
+        )
         self.repo.update_office_fields(self.current_claim.key, updates)
         self._load_claims()
         self._reselect_current_claim()
@@ -5105,14 +5780,10 @@ class ClaimsDashboard(QMainWindow):
         self._send_email_message(message)
 
     def _get_email_credentials(self) -> tuple[str, str]:
-        app_password = ""
-        if SECRETS_FILE.exists():
-            try:
-                payload = json.loads(SECRETS_FILE.read_text(encoding="utf-8"))
-                app_password = str(payload.get("office_update_app_password") or "").strip()
-            except (OSError, json.JSONDecodeError):
-                app_password = ""
-        return OFFICE_UPDATE_EMAIL_FROM, app_password
+        secret_settings = _load_email_secret_settings()
+        sender_email = secret_settings.get("sender_email") or OFFICE_UPDATE_EMAIL_FROM
+        app_password = secret_settings.get("app_password") or ""
+        return sender_email, app_password
 
     def _send_email_message(self, message: EmailMessage) -> None:
         sender_email, app_password = self._get_email_credentials()
@@ -5258,12 +5929,19 @@ class ClaimsDashboard(QMainWindow):
                 body_lines.append("")
         else:
             body_lines.extend(["No additional questions were entered.", ""])
-        body_lines.extend(["Thank you,", OFFICE_UPDATE_EMAIL_FROM])
+        sender_email, _ = self._get_email_credentials()
+        body_lines.extend(["Thank you,", sender_email])
 
         message = EmailMessage()
-        message["From"] = OFFICE_UPDATE_EMAIL_FROM
+        message["From"] = sender_email
         message["To"] = self._office_review_email_to()
-        subject_parts = [part for part in (self.current_claim.claim_id, self.current_claim.display_customer) if part]
+        review_question_subject = " | ".join(custom_questions).strip()
+        subject_parts = []
+        if review_question_subject:
+            subject_parts.append(review_question_subject)
+        subject_parts.extend(
+            part for part in (self.current_claim.claim_id, self.current_claim.display_customer) if part
+        )
         message["Subject"] = f"Review - {' - '.join(subject_parts)}" if subject_parts else "Review"
         message.set_content("\n".join(body_lines).strip())
         for attachment_path in selected_attachments:
@@ -5306,8 +5984,9 @@ class ClaimsDashboard(QMainWindow):
             return
         answers = dialog.values()
 
+        sender_email, _ = self._get_email_credentials()
         message = EmailMessage()
-        message["From"] = OFFICE_UPDATE_EMAIL_FROM
+        message["From"] = sender_email
         message["To"] = self._office_rmc_email_to()
         message["Subject"] = "Need RMC please"
         message.set_content(
@@ -5334,8 +6013,9 @@ class ClaimsDashboard(QMainWindow):
         shop_name = self._ensure_shop_name_for_supplement_request(self.current_claim)
         if not shop_name or not self.current_claim:
             return
+        sender_email, _ = self._get_email_credentials()
         message = EmailMessage()
-        message["From"] = OFFICE_UPDATE_EMAIL_FROM
+        message["From"] = sender_email
         message["To"] = self._office_supplement_email_to()
         message["Subject"] = OFFICE_SUPPLEMENT_EMAIL_SUBJECT
         message.set_content(self._supplement_request_email_body(self.current_claim, shop_name=shop_name))
@@ -5464,9 +6144,11 @@ class ClaimsDashboard(QMainWindow):
 
         self._update_current_claim_shop_info(shop_name, shop_email)
 
-        body = f"{message_text}\n\nthank you!\nfernando" if leave_message and message_text else "thank you!\nfernando"
+        sender_email, _ = self._get_email_credentials()
+        sender_name = sender_email.split("@", 1)[0] if sender_email else "sender"
+        body = f"{message_text}\n\nthank you!\n{sender_name}" if leave_message and message_text else f"thank you!\n{sender_name}"
         message = EmailMessage()
-        message["From"] = OFFICE_UPDATE_EMAIL_FROM
+        message["From"] = sender_email
         message["To"] = shop_email
         message["Subject"] = "please review and advise"
         message.set_content(body)
@@ -5583,7 +6265,7 @@ $mail.Display()
             f"Shop Name: {self.current_claim.shop_name or '-'}",
             "",
             "Thank you,",
-            OFFICE_UPDATE_EMAIL_FROM,
+            self._get_email_credentials()[0],
         ]
         try:
             self._open_outlook_draft(shop_email, subject, "\n".join(body_lines).strip(), selected_attachments)
@@ -5610,7 +6292,7 @@ $mail.Display()
             source = Path(claim.source_path)
             if source.exists() and source.is_dir():
                 return source
-        fallback = APP_DIR / "working_sheets"
+        fallback = DATA_DIR / "working_sheets"
         fallback.mkdir(parents=True, exist_ok=True)
         return fallback
 
@@ -5650,7 +6332,7 @@ $mail.Display()
         aftermarket: str,
         final_comments: str,
     ) -> None:
-        template_root = Path(str(self.settings.get("claim_tools_folder", "") or ""))
+        template_root = self._claim_tools_root()
         template_path = template_root / "MITCHELL TOTAL LOSS.doc"
         if not template_path.exists():
             raise RuntimeError("Mitchell total loss template is missing.")
@@ -5737,7 +6419,7 @@ $mail.Display()
             "text_fields": text_field_map,
             "checkbox_values": checkbox_values,
         }
-        payload_path = APP_DIR / "mitchell_fill_payload_3.json"
+        payload_path = DATA_DIR / "mitchell_fill_payload_3.json"
         payload_path.write_text(json.dumps(payload), encoding="utf-8")
 
         script = r"""
@@ -5917,6 +6599,231 @@ finally {{
     def _autosource_answers_path(self, pdf_path: Path) -> Path:
         return pdf_path.with_suffix(".answers.json")
 
+    def _load_existing_crawford_answers(self, claim: ClaimView) -> dict[str, str]:
+        target_folder = self._record_folder_path(claim)
+        primary_answers = self._crawford_answers_path(self._crawford_output_path(claim))
+        candidates: list[Path] = []
+        if primary_answers.exists():
+            candidates.append(primary_answers)
+        else:
+            candidates = sorted(target_folder.glob("*CRAWFORD*.answers.json"), key=lambda path: path.stat().st_mtime)
+        if not candidates:
+            return {}
+        try:
+            return json.loads(candidates[-1].read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _crawford_answers_path(self, pdf_path: Path) -> Path:
+        return pdf_path.with_suffix(".answers.json")
+
+    def _crawford_output_path(self, claim: ClaimView) -> Path:
+        target_folder = self._record_folder_path(claim)
+        claim_suffix = (claim.claim_id or "claim")[-4:]
+        return target_folder / f"{claim_suffix}-CRAWFORDCOVER.pdf"
+
+    def _cleanup_legacy_crawford_artifacts(self, pdf_path: Path) -> None:
+        folder = pdf_path.parent
+        keep_names = {
+            pdf_path.name.lower(),
+            self._crawford_answers_path(pdf_path).name.lower(),
+        }
+        legacy_patterns = [
+            "*CRAWFORD-COVER-SHEET*.pdf",
+            "*CRAWFORD-COVER-SHEET*.answers.json",
+        ]
+        for pattern in legacy_patterns:
+            for candidate in folder.glob(pattern):
+                if candidate.name.lower() in keep_names:
+                    continue
+                try:
+                    candidate.unlink()
+                except Exception:
+                    pass
+
+    def _crawford_px_rect(self, x1: int, y1: int, x2: int, y2: int) -> tuple[float, float, float, float]:
+        scale_x = 612.0 / 1224.0
+        scale_y = 792.0 / 1584.0
+        return (
+            x1 * scale_x,
+            792.0 - (y2 * scale_y),
+            (x2 - x1) * scale_x,
+            (y2 - y1) * scale_y,
+        )
+
+    def _state_from_address(self, address: str) -> str:
+        match = re.search(r",\s*([A-Z]{2})\s+\d{5}(?:-\d{4})?\s*$", address or "", re.IGNORECASE)
+        return (match.group(1).upper() if match else "")
+
+    def _street_from_address(self, address: str) -> str:
+        cleaned = (address or "").strip()
+        if not cleaned:
+            return ""
+        parts = [part.strip() for part in cleaned.split(",")]
+        if len(parts) >= 3:
+            return parts[0]
+        return cleaned
+
+    def _crawford_contacted_default(self, claim: ClaimView) -> str:
+        progress = (claim.office_progress_status or "").strip().lower()
+        if not progress or progress == "no contact yet":
+            return "No"
+        return "Yes"
+
+    def _crawford_inspected_default(self, claim: ClaimView) -> str:
+        progress = (claim.office_progress_status or "").strip().lower()
+        if (claim.status or "").strip().lower() == "closed" or (claim.office_appt_when or "").strip():
+            return "Yes"
+        if progress in {"written - under review", "written", "supplement - waiting for paperwork", "done", "sent thru apptrak"}:
+            return "Yes"
+        return "No"
+
+    def _crawford_completed_default(self, claim: ClaimView) -> str:
+        return "Yes" if (claim.status or "").strip().lower() == "closed" else "No"
+
+    def _crawford_drivable_default(self, claim: ClaimView) -> str:
+        notes_text = " ".join(
+            part for part in [claim.assignment_claim_notes, claim.office_additional_notes, claim.notes] if part
+        ).lower()
+        if claim.total_loss or "not drivable" in notes_text:
+            return "No"
+        return "Yes" if claim.vehicle else ""
+
+    def _crawford_total_loss_default(self, claim: ClaimView) -> str:
+        return "Yes" if claim.total_loss or "total" in (claim.claim_type or "").lower() else "No"
+
+    def _crawford_shop_entry(self, claim: ClaimView) -> BodyShopEntry | None:
+        index = self._match_body_shop_index(claim)
+        if index is None or index < 0 or index >= len(self.body_shop_entries):
+            return None
+        return self.body_shop_entries[index]
+
+    def _crawford_cover_sheet_defaults(self, claim: ClaimView, existing: dict[str, str]) -> dict[str, str]:
+        sender_email, _ = self._get_email_credentials()
+        shop_entry = self._crawford_shop_entry(claim)
+        inspection_location = claim.location_of_vehicle or claim.shop_name or claim.owner_address or ""
+        shop_address = (shop_entry.address if shop_entry else "") or ""
+        saved_address = (existing.get("address") or "").strip()
+        normalized_saved_address = self._normalize_shop_name(saved_address)
+        normalized_shop_name = self._normalize_shop_name(claim.shop_name or "")
+        normalized_location = self._normalize_shop_name(inspection_location)
+        if normalized_saved_address and normalized_saved_address in {normalized_shop_name, normalized_location}:
+            saved_address = ""
+        agreed_default = "Yes" if (claim.status or "").strip().lower() == "closed" and (claim.shop_name or shop_entry) else "N/A"
+        unrelated_default = "No"
+        return {
+            "appraiser": existing.get("appraiser") or "Fernando Marin",
+            "appraiser_phone_email": existing.get("appraiser_phone_email") or (sender_email or ""),
+            "claim_number": existing.get("claim_number") or (claim.claim_number or claim.claim_id or ""),
+            "branch_file_number": existing.get("branch_file_number") or (claim.claim_id or ""),
+            "contacted": existing.get("contacted") or self._crawford_contacted_default(claim),
+            "inspected": existing.get("inspected") or self._crawford_inspected_default(claim),
+            "completed": existing.get("completed") or self._crawford_completed_default(claim),
+            "drivable": existing.get("drivable") or self._crawford_drivable_default(claim),
+            "total_loss": existing.get("total_loss") or self._crawford_total_loss_default(claim),
+            "days_to_repair": existing.get("days_to_repair") or "N/A",
+            "agreed_price_reached": existing.get("agreed_price_reached") or agreed_default,
+            "no_price_reason": existing.get("no_price_reason") or "N/A",
+            "shop_name": existing.get("shop_name") or claim.shop_name or claim.location_of_vehicle or "",
+            "representative": existing.get("representative") or (shop_entry.contact_name if shop_entry else "") or "N/A",
+            "address": saved_address or shop_address or self._street_from_address(claim.owner_address or inspection_location),
+            "city": existing.get("city") or claim.town or "N/A",
+            "state": existing.get("state") or self._state_from_address(shop_address or claim.owner_address or inspection_location) or "N/A",
+            "zip": existing.get("zip") or self._zip_from_address(shop_address or claim.owner_address or inspection_location) or "N/A",
+            "phone": existing.get("phone") or (shop_entry.phone if shop_entry else "") or claim.shop_phone or claim.contact_phone or "",
+            "federal_id": existing.get("federal_id") or (shop_entry.tax_id if shop_entry else "") or "N/A",
+            "lkq_available": existing.get("lkq_available") or "N/A",
+            "suppliers_contacted": existing.get("suppliers_contacted") or "N/A",
+            "aftermarket_available": existing.get("aftermarket_available") or "N/A",
+            "reconditioned_available": existing.get("reconditioned_available") or "N/A",
+            "shop_receive_copy": existing.get("shop_receive_copy") or "N/A",
+            "owner_receive_copy": existing.get("owner_receive_copy") or "N/A",
+            "betterment": existing.get("betterment") or "No",
+            "unrelated_damage": existing.get("unrelated_damage") or unrelated_default,
+            "describe": existing.get("describe") or ("N/A" if unrelated_default == "No" else ""),
+            "overall_condition": existing.get("overall_condition") or "Average",
+            "approximate_acv": existing.get("approximate_acv") or "",
+            "tire_depth_rf": existing.get("tire_depth_rf") or "",
+            "tire_depth_lf": existing.get("tire_depth_lf") or "",
+            "tire_depth_rr": existing.get("tire_depth_rr") or "",
+            "tire_depth_lr": existing.get("tire_depth_lr") or "",
+            "towing": existing.get("towing") or "",
+            "storage": existing.get("storage") or "",
+            "repair_pct_acv": existing.get("repair_pct_acv") or "",
+            "inspection_location": existing.get("inspection_location") or inspection_location,
+            "repair_stage_at_supplement": existing.get("repair_stage_at_supplement") or "",
+            "comments": existing.get(
+                "comments",
+                claim.assignment_claim_notes or claim.office_additional_notes or claim.notes or "",
+            ),
+        }
+
+    def _finalize_crawford_answers(
+        self,
+        claim: ClaimView,
+        existing: dict[str, str],
+        entered: dict[str, str],
+    ) -> dict[str, str]:
+        final_answers = dict(self._crawford_cover_sheet_defaults(claim, existing))
+        normalized_shop_name = self._normalize_shop_name(claim.shop_name or "")
+        normalized_location = self._normalize_shop_name(claim.location_of_vehicle or claim.shop_name or claim.owner_address or "")
+        for key, value in entered.items():
+            cleaned = (value or "").strip()
+            if key == "address" and cleaned:
+                normalized_cleaned = self._normalize_shop_name(cleaned)
+                if normalized_cleaned and normalized_cleaned in {normalized_shop_name, normalized_location}:
+                    cleaned = ""
+            if cleaned:
+                final_answers[key] = cleaned
+
+        hard_fallbacks = {
+            "appraiser": "Fernando Marin",
+            "appraiser_phone_email": self._get_email_credentials()[0] or "N/A",
+            "claim_number": claim.claim_number or claim.claim_id or "N/A",
+            "branch_file_number": claim.claim_id or "N/A",
+            "contacted": "No",
+            "inspected": "No",
+            "completed": "No",
+            "drivable": "N/A",
+            "total_loss": "No",
+            "days_to_repair": "N/A",
+            "agreed_price_reached": "N/A",
+            "no_price_reason": "N/A",
+            "shop_name": claim.shop_name or claim.location_of_vehicle or "N/A",
+            "representative": "N/A",
+            "address": "N/A",
+            "city": "N/A",
+            "state": "N/A",
+            "zip": "N/A",
+            "phone": claim.shop_phone or claim.contact_phone or "N/A",
+            "federal_id": "N/A",
+            "lkq_available": "N/A",
+            "suppliers_contacted": "N/A",
+            "aftermarket_available": "N/A",
+            "reconditioned_available": "N/A",
+            "shop_receive_copy": "N/A",
+            "owner_receive_copy": "N/A",
+            "betterment": "No",
+            "unrelated_damage": "No",
+            "describe": "N/A",
+            "overall_condition": "Average",
+            "approximate_acv": "N/A",
+            "tire_depth_rf": "N/A",
+            "tire_depth_lf": "N/A",
+            "tire_depth_rr": "N/A",
+            "tire_depth_lr": "N/A",
+            "towing": "N/A",
+            "storage": "N/A",
+            "repair_pct_acv": "N/A",
+            "inspection_location": claim.location_of_vehicle or claim.shop_name or claim.owner_address or "N/A",
+            "repair_stage_at_supplement": "N/A",
+            "comments": claim.assignment_claim_notes or claim.office_additional_notes or claim.notes or "N/A",
+        }
+        for key, fallback in hard_fallbacks.items():
+            if not (final_answers.get(key) or "").strip():
+                final_answers[key] = fallback
+        return final_answers
+
     def _autosource_px_rect(self, x1: int, y1: int, x2: int, y2: int) -> tuple[float, float, float, float]:
         scale_x = 612.0 / 1275.0
         scale_y = 792.0 / 1650.0
@@ -5963,9 +6870,20 @@ finally {{
                 wrapped.append(current_line)
             return wrapped or [text]
 
+        def line_height_for_size(current_size: float) -> float:
+            return current_size + line_gap
+
+        def fits_available_height(line_count: int, current_size: float) -> bool:
+            usable_height = max(1.0, height - bottom_pad + 1.0)
+            return line_count * line_height_for_size(current_size) <= usable_height
+
         lines = wrap_for_size(size)
-        while (len(lines) > max_lines or any(pdf_canvas.stringWidth(line, font_name, size) > available_width for line in lines)) and size > min_font_size:
-            size -= 0.4
+        while (
+            len(lines) > max_lines
+            or any(pdf_canvas.stringWidth(line, font_name, size) > available_width for line in lines)
+            or not fits_available_height(len(lines), size)
+        ) and size > min_font_size:
+            size = max(min_font_size, size - 0.4)
             lines = wrap_for_size(size)
 
         if len(lines) > max_lines:
@@ -5990,10 +6908,11 @@ finally {{
     def _fill_autosource_pda_template(self, output_path: Path, answers: dict[str, str]) -> None:
         if PdfReader is None or PdfWriter is None or reportlab_canvas is None:
             raise RuntimeError("PDF form libraries are not available for the Autosource form.")
-        if not AUTOSOURCE_PDA_TEMPLATE.exists():
-            raise RuntimeError(f"Autosource template is missing:\n{AUTOSOURCE_PDA_TEMPLATE}")
+        template_path = self._autosource_template_path()
+        if not template_path.exists():
+            raise RuntimeError(f"Autosource template is missing:\n{template_path}")
 
-        reader = PdfReader(str(AUTOSOURCE_PDA_TEMPLATE))
+        reader = PdfReader(str(template_path))
         writer = PdfWriter()
         first_page = reader.pages[0]
         page_width = float(first_page.mediabox.width)
@@ -6061,6 +6980,109 @@ finally {{
         pdf_canvas.save()
         overlay_reader = PdfReader(BytesIO(overlay_buffer.getvalue()))
 
+        for index, page in enumerate(reader.pages):
+            page_copy = page
+            if index == 0:
+                page_copy.merge_page(overlay_reader.pages[0])
+            writer.add_page(page_copy)
+
+        with output_path.open("wb") as handle:
+            writer.write(handle)
+
+    def _fill_crawford_cover_sheet_template(self, output_path: Path, answers: dict[str, str]) -> None:
+        if PdfReader is None or PdfWriter is None or reportlab_canvas is None:
+            raise RuntimeError("PDF overlay libraries are not available for the Crawford form.")
+        template_path = self._crawford_cover_sheet_template_path()
+        if not template_path.exists():
+            raise RuntimeError(f"Crawford cover sheet template is missing:\n{template_path}")
+
+        reader = PdfReader(str(template_path))
+        writer = PdfWriter()
+        first_page = reader.pages[0]
+        page_width = float(first_page.mediabox.width)
+        page_height = float(first_page.mediabox.height)
+
+        overlay_buffer = BytesIO()
+        pdf_canvas = reportlab_canvas.Canvas(overlay_buffer, pagesize=(page_width, page_height))
+        pdf_canvas.setFillColorRGB(0.07, 0.14, 0.22)
+
+        field_rects = {
+            "appraiser": self._crawford_px_rect(705, 194, 1082, 220),
+            "appraiser_phone_email": self._crawford_px_rect(820, 220, 1082, 247),
+            "claim_number": self._crawford_px_rect(758, 250, 1082, 281),
+            "branch_file_number": self._crawford_px_rect(842, 281, 1082, 309),
+            "contacted": self._crawford_px_rect(240, 411, 328, 449),
+            "inspected": self._crawford_px_rect(420, 411, 516, 449),
+            "completed": self._crawford_px_rect(612, 411, 706, 449),
+            "drivable": self._crawford_px_rect(804, 411, 892, 449),
+            "total_loss": self._crawford_px_rect(992, 411, 1082, 449),
+            "days_to_repair": self._crawford_px_rect(250, 454, 328, 497),
+            "agreed_price_reached": self._crawford_px_rect(595, 454, 1080, 497),
+            "no_price_reason": self._crawford_px_rect(530, 503, 1080, 553),
+            "shop_name": self._crawford_px_rect(285, 558, 516, 599),
+            "representative": self._crawford_px_rect(702, 558, 1080, 599),
+            "address": self._crawford_px_rect(245, 602, 516, 643),
+            "city": self._crawford_px_rect(590, 602, 724, 643),
+            "state": self._crawford_px_rect(810, 602, 890, 643),
+            "zip": self._crawford_px_rect(968, 602, 1080, 643),
+            "phone": self._crawford_px_rect(220, 646, 516, 687),
+            "federal_id": self._crawford_px_rect(662, 646, 1080, 687),
+            "lkq_available": self._crawford_px_rect(418, 690, 516, 731),
+            "suppliers_contacted": self._crawford_px_rect(756, 690, 1080, 731),
+            "aftermarket_available": self._crawford_px_rect(500, 734, 1080, 777),
+            "reconditioned_available": self._crawford_px_rect(560, 778, 1080, 821),
+            "shop_receive_copy": self._crawford_px_rect(400, 822, 516, 865),
+            "owner_receive_copy": self._crawford_px_rect(870, 822, 890, 865),
+            "betterment": self._crawford_px_rect(1015, 822, 1080, 865),
+            "unrelated_damage": self._crawford_px_rect(390, 866, 516, 909),
+            "describe": self._crawford_px_rect(650, 866, 1080, 909),
+            "overall_condition": self._crawford_px_rect(390, 910, 516, 953),
+            "approximate_acv": self._crawford_px_rect(810, 910, 1080, 953),
+            "tire_depth_rf": self._crawford_px_rect(392, 954, 516, 996),
+            "tire_depth_lf": self._crawford_px_rect(648, 954, 706, 996),
+            "tire_depth_rr": self._crawford_px_rect(830, 954, 890, 996),
+            "tire_depth_lr": self._crawford_px_rect(992, 954, 1080, 996),
+            "towing": self._crawford_px_rect(270, 998, 328, 1040),
+            "storage": self._crawford_px_rect(455, 998, 516, 1040),
+            "repair_pct_acv": self._crawford_px_rect(928, 998, 1080, 1040),
+            "inspection_location": self._crawford_px_rect(420, 1042, 516, 1084),
+            "repair_stage_at_supplement": self._crawford_px_rect(910, 1042, 1080, 1084),
+            "comments": self._crawford_px_rect(240, 1088, 1076, 1482),
+        }
+
+        for key, rect in field_rects.items():
+            if key == "overall_condition" and (answers.get(key, "").strip().lower() == "average"):
+                continue
+            font_size = 8.0 if key != "comments" else 8.4
+            min_font_size = 6.0
+            line_gap = 1.4
+            bottom_pad = 2.0
+            if key == "comments":
+                max_lines = 14
+            elif key == "describe":
+                max_lines = 3
+                min_font_size = 4.8
+                line_gap = 0.4
+                bottom_pad = 1.0
+            elif key in {"no_price_reason", "shop_name", "representative"}:
+                max_lines = 3
+            elif key in {"inspection_location", "repair_stage_at_supplement"}:
+                max_lines = 2
+            else:
+                max_lines = 1
+            self._draw_text_in_pdf_rect(
+                pdf_canvas,
+                answers.get(key, ""),
+                rect,
+                font_size=font_size,
+                min_font_size=min_font_size,
+                max_lines=max_lines,
+                line_gap=line_gap,
+                bottom_pad=bottom_pad,
+            )
+
+        pdf_canvas.save()
+        overlay_reader = PdfReader(BytesIO(overlay_buffer.getvalue()))
         for index, page in enumerate(reader.pages):
             page_copy = page
             if index == 0:
@@ -6222,6 +7244,106 @@ finally {{
             QMessageBox.information(self, APP_NAME, f"Created:\n{pdf_path}")
         except Exception as exc:
             QMessageBox.warning(self, APP_NAME, f"Could not fill the Autosource template:\n{exc}")
+
+    def _generate_crawford_cover_sheet(self) -> None:
+        if not self.current_claim:
+            return
+        if PdfReader is None or PdfWriter is None or reportlab_canvas is None:
+            QMessageBox.warning(self, APP_NAME, "PDF overlay tools are not available for the Crawford form.")
+            return
+
+        existing = self._load_existing_crawford_answers(self.current_claim)
+        defaults = self._crawford_cover_sheet_defaults(self.current_claim, existing)
+        yes_no_options = ["Yes", "No", "N/A"]
+        condition_options = ["Poor", "Fair", "Average", "Good", "Excellent"]
+
+        top_questions = [
+            ("appraiser", "Appraiser", False),
+            ("appraiser_phone_email", "Appraiser Phone / Email", False),
+            ("claim_number", "Claim Number", False),
+            ("branch_file_number", "Branch-File Number", False),
+            ("contacted", "Contacted", False),
+            ("inspected", "Inspected", False),
+            ("completed", "Completed", False),
+            ("drivable", "Drivable?", False, yes_no_options),
+            ("total_loss", "Total Loss?", False, yes_no_options),
+            ("days_to_repair", "Days to Repair", False),
+            ("agreed_price_reached", "Was agreed price reached with shop?", False, yes_no_options),
+            ("no_price_reason", "Reason no price was reached", True),
+        ]
+        top_dialog = WizardDialog(self, "Crawford Cover Sheet - Claim Status", top_questions, defaults)
+        if top_dialog.exec() != QDialog.Accepted:
+            return
+        top_answers = top_dialog.values()
+
+        shop_questions = [
+            ("shop_name", "Shop Name", False),
+            ("representative", "Representative", False),
+            ("address", "Address", False),
+            ("city", "City", False),
+            ("state", "State", False),
+            ("zip", "Zip", False),
+            ("phone", "Phone", False),
+            ("federal_id", "Federal ID #", False),
+            ("lkq_available", "LKQ Available / Applicable?", False, yes_no_options),
+            ("suppliers_contacted", "Supplier(s) Contacted", False),
+            ("aftermarket_available", "Aftermarket Available / Applicable?", False, yes_no_options),
+            ("reconditioned_available", "Reconditioned Available / Applicable?", False, yes_no_options),
+            ("shop_receive_copy", "Shop Receive Copy?", False, yes_no_options),
+            ("owner_receive_copy", "Owner Receive Copy?", False, yes_no_options),
+            ("betterment", "Betterment?", False, yes_no_options),
+            ("unrelated_damage", "Unrelated Damage?", False, yes_no_options),
+            ("describe", "Describe", True),
+        ]
+        shop_dialog = WizardDialog(self, "Crawford Cover Sheet - Shop And Parts", shop_questions, defaults)
+        if shop_dialog.exec() != QDialog.Accepted:
+            return
+        shop_answers = shop_dialog.values()
+
+        notes_questions = [
+            ("overall_condition", "Overall Condition", False, condition_options),
+            ("approximate_acv", "Approximate ACV", False),
+            ("tire_depth_rf", "RF Tire Depth", False),
+            ("tire_depth_lf", "LF Tire Depth", False),
+            ("tire_depth_rr", "RR Tire Depth", False),
+            ("tire_depth_lr", "LR Tire Depth", False),
+            ("towing", "Towing", False),
+            ("storage", "Storage", False),
+            ("repair_pct_acv", "Repair as % of Approximate ACV", False),
+            ("inspection_location", "Inspection Location", False),
+            ("repair_stage_at_supplement", "Repair Stage at Supplement", False),
+            ("comments", "Comments", True),
+        ]
+        notes_dialog = WizardDialog(self, "Crawford Cover Sheet - Condition And Comments", notes_questions, defaults)
+        if notes_dialog.exec() != QDialog.Accepted:
+            return
+        notes_answers = notes_dialog.values()
+
+        answers: dict[str, str] = {}
+        answers.update(top_answers)
+        answers.update(shop_answers)
+        answers.update(notes_answers)
+        final_answers = self._finalize_crawford_answers(self.current_claim, existing, answers)
+
+        pdf_path = self._crawford_output_path(self.current_claim)
+        answers_path = self._crawford_answers_path(pdf_path)
+
+        try:
+            self._fill_crawford_cover_sheet_template(pdf_path, final_answers)
+            answers_path.write_text(json.dumps(final_answers, indent=2), encoding="utf-8")
+            self._cleanup_legacy_crawford_artifacts(pdf_path)
+            opened_pdf = QDesktopServices.openUrl(QUrl.fromLocalFile(str(pdf_path)))
+            self._reveal_generated_file(pdf_path)
+            if opened_pdf:
+                QMessageBox.information(self, APP_NAME, f"Created:\n{pdf_path}")
+            else:
+                QMessageBox.information(
+                    self,
+                    APP_NAME,
+                    f"Created:\n{pdf_path}\n\nThe PDF viewer did not open automatically, so the file was revealed in the claim folder.",
+                )
+        except Exception as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not fill the Crawford cover sheet:\n{exc}")
 
     def _generate_aig_claim_summary(self) -> None:
         if not self.current_claim:
@@ -6709,6 +7831,23 @@ finally {{
         else:
             subprocess.Popen(["open", str(folder)])
 
+    def _reveal_generated_file(self, file_path: Path) -> None:
+        if not file_path.exists():
+            return
+        try:
+            if sys.platform.startswith("win"):
+                subprocess.Popen(["explorer", f"/select,{str(file_path)}"])
+            else:
+                subprocess.Popen(["open", str(file_path.parent)])
+        except Exception:
+            try:
+                if sys.platform.startswith("win"):
+                    os.startfile(str(file_path.parent))  # type: ignore[attr-defined]
+                else:
+                    subprocess.Popen(["open", str(file_path.parent)])
+            except Exception:
+                pass
+
 
 def main() -> int:
     app = QApplication(sys.argv)
@@ -6716,6 +7855,9 @@ def main() -> int:
     app.setApplicationVersion(APP_VERSION)
     window = ClaimsDashboard()
     window.show()
+    window.showNormal()
+    window.raise_()
+    window.activateWindow()
     return app.exec()
 
 

@@ -9,6 +9,7 @@ import React, {
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
   ActivityIndicator,
+  Alert,
   FlatList,
   Image,
   Linking,
@@ -21,22 +22,174 @@ import {
   StatusBar as NativeStatusBar,
   Text,
   TextInput,
+  Vibration,
   View,
 } from "react-native";
 import { StatusBar as ExpoStatusBar } from "expo-status-bar";
 import { CameraView, useCameraPermissions } from "expo-camera";
+import * as DocumentPicker from "expo-document-picker";
+import * as FileSystem from "expo-file-system/legacy";
 import * as ImagePicker from "expo-image-picker";
 import * as ImageManipulator from "expo-image-manipulator";
 import * as Updates from "expo-updates";
 import appConfig from "./app.json";
 
-const API_BASE_DEFAULT = "https://api2.luxuryimportsusa.shop";
-const API_BASE_LEGACY = "https://api.luxuryimportsusa.shop";
+function normalizeBaseUrl(value) {
+  return String(value || "").trim().replace(/\/+$/, "");
+}
+
+function cleanString(value) {
+  return String(value || "").trim();
+}
+
+function parseFallbackBases(value) {
+  return String(value || "")
+    .split(",")
+    .map((entry) => normalizeBaseUrl(entry))
+    .filter((entry) => entry && entry !== "__NONE__");
+}
+
+function normalizeVariantKey(value) {
+  return cleanString(value).toLowerCase().replace(/[^a-z0-9]+/g, "_") || "default";
+}
+
+function parseBooleanFlag(value) {
+  return cleanString(value).toLowerCase() === "true";
+}
+
+function parseUiScaleValue(value, fallback = 1) {
+  const parsed = Number.parseFloat(String(value ?? fallback));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const UPDATE_CHANNEL = cleanString(Updates.channel).toLowerCase();
+const CHANNEL_PRESETS = {
+  joe: {
+    appVariant: "joe",
+    ownerName: "Joe Lasala",
+    apiBase: "https://joe-api.luxuryimportsusa.shop",
+    apiFallbacks: [],
+    disableFontScaling: true,
+    uiScale: 0.9,
+    lockConnection: true,
+  },
+  production: {
+    appVariant: "default",
+    ownerName: "Fernando Marin",
+    apiBase: "https://api.luxuryimportsusa.shop",
+    apiFallbacks: ["https://api2.luxuryimportsusa.shop"],
+    disableFontScaling: false,
+    uiScale: 1,
+    lockConnection: false,
+  },
+};
+const ACTIVE_CHANNEL_PRESET = CHANNEL_PRESETS[UPDATE_CHANNEL] || null;
+const API_BASE_DEFAULT =
+  normalizeBaseUrl(ACTIVE_CHANNEL_PRESET?.apiBase || process.env.EXPO_PUBLIC_API_BASE) ||
+  "https://api.luxuryimportsusa.shop";
+const API_BASE_FALLBACKS = parseFallbackBases(
+  ACTIVE_CHANNEL_PRESET ? ACTIVE_CHANNEL_PRESET.apiFallbacks.join(",") : process.env.EXPO_PUBLIC_API_FALLBACKS ?? "https://api2.luxuryimportsusa.shop"
+).filter((entry, index, values) => entry !== API_BASE_DEFAULT && values.indexOf(entry) === index);
+const APP_VARIANT = normalizeVariantKey(ACTIVE_CHANNEL_PRESET?.appVariant || process.env.EXPO_PUBLIC_APP_VARIANT || "default");
+const APP_OWNER_LABEL =
+  cleanString(ACTIVE_CHANNEL_PRESET?.ownerName || process.env.EXPO_PUBLIC_APP_OWNER_NAME) || "Fernando Marin";
+const DISABLE_FONT_SCALING = ACTIVE_CHANNEL_PRESET
+  ? Boolean(ACTIVE_CHANNEL_PRESET.disableFontScaling)
+  : parseBooleanFlag(process.env.EXPO_PUBLIC_DISABLE_FONT_SCALING);
+const UI_SCALE = ACTIVE_CHANNEL_PRESET
+  ? parseUiScaleValue(ACTIVE_CHANNEL_PRESET.uiScale, 1)
+  : parseUiScaleValue(process.env.EXPO_PUBLIC_UI_SCALE, 1);
+const CONNECTION_LOCKED = ACTIVE_CHANNEL_PRESET
+  ? Boolean(ACTIVE_CHANNEL_PRESET.lockConnection)
+  : parseBooleanFlag(process.env.EXPO_PUBLIC_LOCK_CONNECTION);
 const BULLET = " | ";
-const API_BASE_STORAGE_KEY = "claim_manager_mobile_api_base";
-const ROUTE_PLAN_STORAGE_KEY = "claim_manager_mobile_route_plan_keys";
-const ROUTE_ADDRESS_OVERRIDES_STORAGE_KEY = "claim_manager_mobile_route_address_overrides";
+const API_BASE_STORAGE_KEY = `claim_manager_mobile_api_base_${APP_VARIANT}`;
+const ROUTE_PLAN_STORAGE_KEY = `claim_manager_mobile_route_plan_keys_${APP_VARIANT}`;
+const ROUTE_ADDRESS_OVERRIDES_STORAGE_KEY = `claim_manager_mobile_route_address_overrides_${APP_VARIANT}`;
+const PHOTO_UPLOAD_QUEUE_STORAGE_KEY = `claim_manager_mobile_photo_upload_queue_${APP_VARIANT}`;
 const APP_VERSION = appConfig?.expo?.version || "unknown";
+const APP_RELEASE_LABEL =
+  cleanString(process.env.EXPO_PUBLIC_RELEASE_LABEL) ||
+  cleanString(appConfig?.expo?.extra?.releaseLabel) ||
+  `${UPDATE_CHANNEL || "default"}-runtime`;
+const CONNECTION_HINT = CONNECTION_LOCKED
+  ? "This build is pinned to Joe's PC endpoint."
+  : "Use the secure Cloudflare address by default, or switch back to local if you are on the same network.";
+
+function scaleUi(value) {
+  return Math.round(value * UI_SCALE * 100) / 100;
+}
+
+function hostnameFromBase(value) {
+  try {
+    return new URL(normalizeBaseUrl(value)).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function isLocalNetworkBase(value) {
+  const host = hostnameFromBase(value);
+  if (!host) {
+    return false;
+  }
+  if (host === "localhost" || host === "127.0.0.1") {
+    return true;
+  }
+  if (/^192\.168\./.test(host) || /^10\./.test(host)) {
+    return true;
+  }
+  const match172 = host.match(/^172\.(\d{1,3})\./);
+  if (match172) {
+    const second = Number.parseInt(match172[1], 10);
+    if (second >= 16 && second <= 31) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isLegacyOrDisallowedPublicBase(value) {
+  const normalized = normalizeBaseUrl(value);
+  if (!normalized) {
+    return false;
+  }
+  if (normalized === API_BASE_DEFAULT) {
+    return false;
+  }
+  if (API_BASE_FALLBACKS.includes(normalized)) {
+    return true;
+  }
+  return !isLocalNetworkBase(normalized);
+}
+
+if (DISABLE_FONT_SCALING) {
+  Text.defaultProps = {
+    ...(Text.defaultProps || {}),
+    allowFontScaling: false,
+    maxFontSizeMultiplier: 1,
+  };
+  TextInput.defaultProps = {
+    ...(TextInput.defaultProps || {}),
+    allowFontScaling: false,
+    maxFontSizeMultiplier: 1,
+  };
+}
+
+function digitsOnlyPhone(value) {
+  return String(value || "").replace(/[^\d+]/g, "");
+}
+
+function formatPhone(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (digits.length === 11 && digits.startsWith("1")) {
+    return `+1 (${digits.slice(1, 4)}) ${digits.slice(4, 7)}-${digits.slice(7)}`;
+  }
+  if (digits.length === 10) {
+    return `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}`;
+  }
+  return String(value || "").trim();
+}
 
 const HOME_TABS = [
   ["claims", "Claims"],
@@ -48,6 +201,7 @@ const CLAIM_TABS = [
   ["open", "Open"],
   ["closed", "Closed"],
   ["all", "All"],
+  ["new", "New"],
 ];
 
 const ROUTE_STATUS_TABS = [
@@ -65,6 +219,7 @@ const LIBRARY_TABS = [
 const PHOTO_LABEL_OPTIONS = [
   "VIN",
   "MILEAGE",
+  "MEASUREMENT",
   "LICENSE PLATE",
   "INTERIOR",
   "DASHBOARD",
@@ -77,16 +232,47 @@ const PHOTO_LABEL_OPTIONS = [
   "UPD",
   "TIRE INFO",
   "INVOICE",
+  "TOW BILL",
   "ESTIMATE",
   "DOP",
   "REPAIR AUTHORIZATION",
   "OTHER",
 ];
 
+const COMMON_EMAIL_RECIPIENTS = [
+  { label: "Joe", email: "joe@lasalallc.com" },
+  { label: "Lisa", email: "ldellacorte@duhamels.com" },
+  { label: "Donna", email: "dnoone@duhamels.com" },
+  { label: "Gina", email: "gferreira@duhamels.com" },
+];
+
+const PHOTO_ZOOM_OPTIONS = [
+  { label: "1x", value: 0 },
+  { label: "1.5x", value: 0.15 },
+  { label: "2x", value: 0.3 },
+  { label: "3x", value: 0.5 },
+];
+
 const MOBILE_PHOTO_MAX_SIDE = 1920;
 const MOBILE_PHOTO_PRIMARY_COMPRESSION = 0.62;
 const MOBILE_PHOTO_SECONDARY_COMPRESSION = 0.54;
 const MOBILE_PHOTO_HEAVY_COMPRESSION = 0.46;
+const PHOTO_UPLOAD_QUEUE_RETRY_MS = 30000;
+const PHOTO_UPLOAD_QUEUE_DIR = `${FileSystem.documentDirectory || FileSystem.cacheDirectory || ""}claim-photo-upload-queue/`;
+
+function sanitizePhotoQueueName(value) {
+  const cleaned = cleanString(value).replace(/\.[^.]+$/, "");
+  const safe = cleaned.replace(/[^a-z0-9_-]+/gi, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+  return safe || "claim-photo";
+}
+
+function createPhotoQueueId() {
+  return `photo-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function queueUploadLabel(item) {
+  return cleanString(item?.label) || cleanString(item?.name) || "Photo";
+}
 
 async function prepareUploadPhoto(asset) {
   const manipulations = [];
@@ -136,6 +322,11 @@ async function prepareUploadPhoto(asset) {
     uri: result.uri,
     name: (asset.fileName || "claim-photo").replace(/\.[^.]+$/, "") + ".jpg",
     type: "image/jpeg",
+    capturedAt:
+      asset?.capturedAt ||
+      asset?.creationTime ||
+      asset?.modificationTime ||
+      new Date().toISOString(),
   };
 }
 
@@ -144,7 +335,7 @@ export default function App() {
   const [utilityOpen, setUtilityOpen] = useState(false);
   const [homeTab, setHomeTab] = useState("claims");
   const [claimTab, setClaimTab] = useState("open");
-  const [routeStatus, setRouteStatus] = useState("all");
+  const [routeStatus, setRouteStatus] = useState("open");
   const [libraryTab, setLibraryTab] = useState("tools");
   const [search, setSearch] = useState("");
   const [dashboard, setDashboard] = useState({
@@ -152,6 +343,7 @@ export default function App() {
     settings: {},
   });
   const [claimRecords, setClaimRecords] = useState([]);
+  const [claimPhoneMap, setClaimPhoneMap] = useState({});
   const [routeData, setRouteData] = useState({
     start_from: "",
     records: [],
@@ -172,11 +364,27 @@ export default function App() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [noteSaving, setNoteSaving] = useState(false);
   const [uploadingPhoto, setUploadingPhoto] = useState(false);
+  const [emailModalVisible, setEmailModalVisible] = useState(false);
+  const [selectedPdfPaths, setSelectedPdfPaths] = useState([]);
+  const [emailTo, setEmailTo] = useState("");
+  const [emailCc, setEmailCc] = useState("");
+  const [emailSubject, setEmailSubject] = useState("");
+  const [emailBody, setEmailBody] = useState("");
+  const [emailSending, setEmailSending] = useState(false);
+  const [emailRecipientPickerOpen, setEmailRecipientPickerOpen] = useState(false);
+  const [assignmentUploadInFlight, setAssignmentUploadInFlight] = useState(false);
+  const [assignmentUploadResult, setAssignmentUploadResult] = useState(null);
   const [photoSessionVisible, setPhotoSessionVisible] = useState(false);
   const [pendingPhotoAsset, setPendingPhotoAsset] = useState(null);
   const [pendingPhotoLabel, setPendingPhotoLabel] = useState("");
   const [photoSessionUploads, setPhotoSessionUploads] = useState([]);
+  const [queuedPhotoUploads, setQueuedPhotoUploads] = useState([]);
+  const [queuedPhotoUploadsReady, setQueuedPhotoUploadsReady] = useState(false);
+  const [queueFlushing, setQueueFlushing] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
+  const [photoZoom, setPhotoZoom] = useState(0);
+  const [photoCaptureCueVisible, setPhotoCaptureCueVisible] = useState(false);
+  const [photoCaptureCueText, setPhotoCaptureCueText] = useState("");
   const [routeSaving, setRouteSaving] = useState(false);
   const [routePlanReady, setRoutePlanReady] = useState(false);
   const [routeAddressOverrides, setRouteAddressOverrides] = useState({});
@@ -192,12 +400,15 @@ export default function App() {
   const [apiReady, setApiReady] = useState(false);
   const loadSequence = useRef(0);
   const cameraRef = useRef(null);
+  const photoCaptureCueTimeoutRef = useRef(null);
+  const queuedPhotoUploadsRef = useRef([]);
+  const queueFlushInFlightRef = useRef(false);
   const deferredSearch = useDeferredValue(search);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
-  const currentChannel = Updates.channel || "preview";
+  const currentChannel = UPDATE_CHANNEL || "preview";
   const currentRuntimeVersion = Updates.runtimeVersion || APP_VERSION;
   const currentUpdateId = Updates.updateId ? Updates.updateId.slice(0, 8) : "embedded";
-  const currentVersionLabel = `v${APP_VERSION} / ${currentChannel} / ${currentUpdateId}`;
+  const currentVersionLabel = `v${APP_VERSION} / r${APP_RELEASE_LABEL} / ${currentChannel} / ${currentUpdateId}`;
   const currentVersionDetail = `Runtime ${currentRuntimeVersion}`;
   const listPerfProps = {
     initialNumToRender: 10,
@@ -205,15 +416,34 @@ export default function App() {
     windowSize: 7,
     removeClippedSubviews: true,
   };
+  const currentClaimQueuedUploads = useMemo(
+    () => queuedPhotoUploads.filter((item) => item.claimKey === selectedClaimKey),
+    [queuedPhotoUploads, selectedClaimKey]
+  );
+
+  useEffect(() => {
+    return () => {
+      if (photoCaptureCueTimeoutRef.current) {
+        clearTimeout(photoCaptureCueTimeoutRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
 
     async function loadStoredApiBase() {
+      if (CONNECTION_LOCKED) {
+        if (!cancelled) {
+          setApiBase(API_BASE_DEFAULT);
+          setApiReady(true);
+        }
+        return;
+      }
       try {
-        const saved = (await AsyncStorage.getItem(API_BASE_STORAGE_KEY))?.trim();
+        const saved = normalizeBaseUrl(await AsyncStorage.getItem(API_BASE_STORAGE_KEY));
         if (!cancelled && saved) {
-          if (saved === API_BASE_LEGACY) {
+          if (isLegacyOrDisallowedPublicBase(saved)) {
             await AsyncStorage.setItem(API_BASE_STORAGE_KEY, API_BASE_DEFAULT);
             setApiBase(API_BASE_DEFAULT);
           } else {
@@ -236,8 +466,59 @@ export default function App() {
     if (!apiReady) {
       return;
     }
-    AsyncStorage.setItem(API_BASE_STORAGE_KEY, apiBase.trim()).catch(() => {});
+    if (CONNECTION_LOCKED) {
+      return;
+    }
+    const normalizedBase = normalizeBaseUrl(apiBase);
+    if (isLegacyOrDisallowedPublicBase(normalizedBase)) {
+      setApiBase(API_BASE_DEFAULT);
+      AsyncStorage.setItem(API_BASE_STORAGE_KEY, API_BASE_DEFAULT).catch(() => {});
+      return;
+    }
+    AsyncStorage.setItem(API_BASE_STORAGE_KEY, normalizedBase).catch(() => {});
   }, [apiBase, apiReady]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadQueuedUploads() {
+      try {
+        const raw = await AsyncStorage.getItem(PHOTO_UPLOAD_QUEUE_STORAGE_KEY);
+        const parsed = raw ? JSON.parse(raw) : [];
+        const normalized = Array.isArray(parsed)
+          ? parsed.filter(
+              (item) =>
+                item &&
+                cleanString(item.id) &&
+                cleanString(item.claimKey) &&
+                cleanString(item.uri)
+            )
+          : [];
+        queuedPhotoUploadsRef.current = normalized;
+        if (!cancelled) {
+          startTransition(() => {
+            setQueuedPhotoUploads(normalized);
+          });
+        }
+      } catch {
+        queuedPhotoUploadsRef.current = [];
+        if (!cancelled) {
+          startTransition(() => {
+            setQueuedPhotoUploads([]);
+          });
+        }
+      } finally {
+        if (!cancelled) {
+          setQueuedPhotoUploadsReady(true);
+        }
+      }
+    }
+
+    loadQueuedUploads();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -331,19 +612,235 @@ export default function App() {
     }
   }, [apiBase, selectedClaimKey, apiReady]);
 
-  async function fetchJson(path, options) {
-    const response = await fetch(`${apiBase}${path}`, options);
-    if (!response.ok) {
-      let message = `Request failed (${response.status}).`;
-      try {
-        const payload = await response.json();
-        if (payload?.error) {
-          message = payload.error;
-        }
-      } catch {}
-      throw new Error(message);
+  useEffect(() => {
+    if (!apiReady || !queuedPhotoUploadsReady || !queuedPhotoUploads.length) {
+      return;
     }
-    return response.json();
+    const initialAttempt = setTimeout(() => {
+      flushQueuedPhotoUploads({ silent: true }).catch(() => {});
+    }, 1500);
+    const retryTimer = setInterval(() => {
+      flushQueuedPhotoUploads({ silent: true }).catch(() => {});
+    }, PHOTO_UPLOAD_QUEUE_RETRY_MS);
+    return () => {
+      clearTimeout(initialAttempt);
+      clearInterval(retryTimer);
+    };
+  }, [apiReady, apiBase, queuedPhotoUploads.length, queuedPhotoUploadsReady]);
+
+  async function persistQueuedPhotoUploads(nextQueue) {
+    queuedPhotoUploadsRef.current = nextQueue;
+    startTransition(() => {
+      setQueuedPhotoUploads(nextQueue);
+    });
+    try {
+      if (nextQueue.length) {
+        await AsyncStorage.setItem(PHOTO_UPLOAD_QUEUE_STORAGE_KEY, JSON.stringify(nextQueue));
+      } else {
+        await AsyncStorage.removeItem(PHOTO_UPLOAD_QUEUE_STORAGE_KEY);
+      }
+    } catch {}
+  }
+
+  async function ensurePhotoQueueDirectory() {
+    if (!PHOTO_UPLOAD_QUEUE_DIR) {
+      throw new Error("This phone could not prepare local offline photo storage.");
+    }
+    await FileSystem.makeDirectoryAsync(PHOTO_UPLOAD_QUEUE_DIR, { intermediates: true }).catch(() => {});
+    return PHOTO_UPLOAD_QUEUE_DIR;
+  }
+
+  async function stagePhotoForOfflineUpload(asset, { claimKey, label = "" }) {
+    const uploadAsset = await prepareUploadPhoto(asset);
+    const queueDir = await ensurePhotoQueueDirectory();
+    const queueId = createPhotoQueueId();
+    const safeName = sanitizePhotoQueueName(uploadAsset.name || label || "claim-photo");
+    const localUri = `${queueDir}${queueId}-${safeName}.jpg`;
+    await FileSystem.copyAsync({ from: uploadAsset.uri, to: localUri });
+    const queueItem = {
+      id: queueId,
+      claimKey,
+      label: cleanString(label),
+      uri: localUri,
+      name: uploadAsset.name || `${safeName}.jpg`,
+      type: uploadAsset.type || "image/jpeg",
+      capturedAt: uploadAsset.capturedAt || new Date().toISOString(),
+      queuedAt: new Date().toISOString(),
+      attempts: 0,
+      lastError: "",
+    };
+    await persistQueuedPhotoUploads([queueItem, ...queuedPhotoUploadsRef.current]);
+    return queueItem;
+  }
+
+  async function flushQueuedPhotoUploads({ specificIds = null, silent = false } = {}) {
+    if (queueFlushInFlightRef.current) {
+      return { uploaded: [], remaining: queuedPhotoUploadsRef.current };
+    }
+    const currentQueue = queuedPhotoUploadsRef.current;
+    if (!currentQueue.length) {
+      return { uploaded: [], remaining: currentQueue };
+    }
+
+    const targetIds = specificIds?.length ? new Set(specificIds) : null;
+    queueFlushInFlightRef.current = true;
+    setQueueFlushing(true);
+
+    const uploaded = [];
+    const nextQueue = [];
+    const touchedClaimKeys = new Set();
+
+    try {
+      for (const item of currentQueue) {
+        if (targetIds && !targetIds.has(item.id)) {
+          nextQueue.push(item);
+          continue;
+        }
+
+        try {
+          const fileInfo = await FileSystem.getInfoAsync(item.uri);
+          if (!fileInfo?.exists) {
+            throw new Error("Queued photo file is missing on this phone.");
+          }
+
+          const formData = new FormData();
+          formData.append("photo", {
+            uri: item.uri,
+            name: item.name,
+            type: item.type || "image/jpeg",
+          });
+
+          const labelParam = cleanString(item.label)
+            ? `&label=${encodeURIComponent(item.label)}`
+            : "";
+          const payload = await fetchJson(
+            `/api/mobile/upload-photo?key=${encodeURIComponent(item.claimKey)}${labelParam}&captured_at=${encodeURIComponent(item.capturedAt || new Date().toISOString())}`,
+            {
+              method: "POST",
+              body: formData,
+            }
+          );
+
+          uploaded.push({
+            id: item.id,
+            claimKey: item.claimKey,
+            label: item.label,
+            savedName: payload?.file?.name || queueUploadLabel(item),
+          });
+          touchedClaimKeys.add(item.claimKey);
+          await FileSystem.deleteAsync(item.uri, { idempotent: true }).catch(() => {});
+        } catch (err) {
+          nextQueue.push({
+            ...item,
+            attempts: Number(item.attempts || 0) + 1,
+            lastError: err?.message || "Upload failed.",
+            lastAttemptAt: new Date().toISOString(),
+          });
+        }
+      }
+
+      await persistQueuedPhotoUploads(nextQueue);
+
+      if (uploaded.length && touchedClaimKeys.has(selectedClaimKey)) {
+        await loadClaimDetail(selectedClaimKey);
+      }
+
+      if (!silent && uploaded.length) {
+        setUpdateMessage(
+          uploaded.length === 1
+            ? `${uploaded[0].savedName} uploaded.`
+            : `${uploaded.length} queued photos uploaded.`
+        );
+      }
+      return { uploaded, remaining: nextQueue };
+    } finally {
+      queueFlushInFlightRef.current = false;
+      setQueueFlushing(false);
+    }
+  }
+
+  async function fetchJson(path, options) {
+    const primaryBase = apiBase || API_BASE_DEFAULT;
+    const tryBases = [primaryBase];
+    if (API_BASE_DEFAULT && API_BASE_DEFAULT !== primaryBase) {
+      tryBases.push(API_BASE_DEFAULT);
+    }
+    for (const fallbackBase of API_BASE_FALLBACKS) {
+      if (fallbackBase && !tryBases.includes(fallbackBase)) {
+        tryBases.push(fallbackBase);
+      }
+    }
+
+    let lastError = null;
+    for (const base of tryBases) {
+      try {
+        const response = await fetch(`${base}${path}`, options);
+        if (!response.ok) {
+          let message = `Request failed (${response.status}).`;
+          try {
+            const payload = await response.json();
+            if (payload?.error) {
+              message = payload.error;
+            }
+          } catch {}
+          const canTryNext =
+            base !== tryBases[tryBases.length - 1] &&
+            (response.status >= 500 || (response.status === 404 && isLegacyOrDisallowedPublicBase(base)));
+          if (canTryNext) {
+            lastError = new Error(message);
+            continue;
+          }
+          throw new Error(message);
+        }
+        if (base !== apiBase) {
+          setApiBase(base);
+          AsyncStorage.setItem(API_BASE_STORAGE_KEY, normalizeBaseUrl(base)).catch(() => {});
+        }
+        setError("");
+        return response.json();
+      } catch (err) {
+        lastError = err;
+        if (base === tryBases[tryBases.length - 1]) {
+          break;
+        }
+      }
+    }
+    throw lastError || new Error("Something went wrong.");
+  }
+
+  async function openPhoneAction(phone, mode) {
+    const normalizedPhone = digitsOnlyPhone(phone);
+    if (!normalizedPhone) {
+      setError("No phone number is available for this claim.");
+      return;
+    }
+    try {
+      await Linking.openURL(`${mode}:${normalizedPhone}`);
+    } catch {
+      setError(`${mode === "sms" ? "Text" : "Call"} could not be opened on this phone.`);
+    }
+  }
+
+  function promptPhoneActions(phone, name) {
+    const formattedPhone = formatPhone(phone);
+    if (!formattedPhone) {
+      Alert.alert(name || "Customer Contact", "No phone number listed.");
+      return;
+    }
+    Alert.alert(name || "Customer Contact", formattedPhone, [
+      { text: "Call", onPress: () => openPhoneAction(phone, "tel") },
+      { text: "Text", onPress: () => openPhoneAction(phone, "sms") },
+      { text: "Cancel", style: "cancel" },
+    ]);
+  }
+
+  async function promptPhoneActionsForRecord(item, name) {
+    try {
+      const phone = await ensureClaimPhone(item?.key);
+      promptPhoneActions(phone, name);
+    } catch (err) {
+      handleError(err);
+    }
   }
 
   function handleError(err) {
@@ -383,6 +880,13 @@ export default function App() {
     setError("");
     try {
       if (homeTab === "claims") {
+        if (claimTab === "new") {
+          startTransition(() => {
+            setClaimRecords([]);
+          });
+          setHasLoadedOnce(true);
+          return;
+        }
         const params = new URLSearchParams({ status: claimTab, search: deferredSearch });
         const payload = await fetchJson(`/api/mobile/claims?${params.toString()}`);
         if (requestId !== loadSequence.current) {
@@ -401,26 +905,13 @@ export default function App() {
           );
         });
       } else if (homeTab === "route") {
-        const [routePayload, claimsPayload] = await Promise.all([
-          fetchJson("/api/mobile/route-planner?status=all"),
-          fetchJson("/api/mobile/claims?status=all"),
-        ]);
+        const params = new URLSearchParams({ status: routeStatus, search: deferredSearch });
+        const routePayload = await fetchJson(`/api/mobile/route-planner?${params.toString()}`);
         if (requestId !== loadSequence.current) {
           return;
         }
-        const claimStatusByKey = new Map(
-          (claimsPayload.records || []).map((record) => [record.key, record.status])
-        );
-        const mergeRouteStatus = (record) => ({
-          ...record,
-          status: claimStatusByKey.get(record.key) || record.status,
-        });
         startTransition(() => {
-          setRouteData({
-            ...routePayload,
-            records: (routePayload.records || []).map(mergeRouteStatus),
-            planned_records: (routePayload.planned_records || []).map(mergeRouteStatus),
-          });
+          setRouteData(routePayload);
         });
       } else if (libraryTab === "tools") {
         const payload = await fetchJson("/api/mobile/claim-tools");
@@ -466,11 +957,147 @@ export default function App() {
     try {
       const payload = await fetchJson(`/api/mobile/claim?key=${encodeURIComponent(key)}`);
       setClaimDetail(payload);
+      if (payload?.key) {
+        setClaimPhoneMap((current) =>
+          current[payload.key] === (payload.contact_phone || "")
+            ? current
+            : { ...current, [payload.key]: payload.contact_phone || "" }
+        );
+      }
       setNoteText("");
+      setSelectedPdfPaths([]);
     } catch (err) {
       handleError(err);
     } finally {
       setDetailLoading(false);
+    }
+  }
+
+  async function ensureClaimPhone(key) {
+    if (!key) {
+      return "";
+    }
+    if (Object.prototype.hasOwnProperty.call(claimPhoneMap, key)) {
+      return claimPhoneMap[key] || "";
+    }
+    const payload = await fetchJson(`/api/mobile/claim?key=${encodeURIComponent(key)}`);
+    const nextPhone = payload?.contact_phone || "";
+    if (payload?.key) {
+      setClaimPhoneMap((current) =>
+        current[payload.key] === nextPhone ? current : { ...current, [payload.key]: nextPhone }
+      );
+    }
+    return nextPhone;
+  }
+
+  function resolvedPhoneForRecord(item) {
+    return claimPhoneMap[item?.key] || item?.contact_phone || "";
+  }
+
+  function isEmailableFile(file) {
+    const lowerName = (file?.name || "").toLowerCase();
+    return (
+      lowerName.endsWith(".pdf") ||
+      lowerName.endsWith(".jpg") ||
+      lowerName.endsWith(".jpeg") ||
+      lowerName.endsWith(".png") ||
+      lowerName.endsWith(".heic") ||
+      lowerName.endsWith(".webp")
+    );
+  }
+
+  function togglePdfSelection(relativePath) {
+    setSelectedPdfPaths((current) =>
+      current.includes(relativePath)
+        ? current.filter((item) => item !== relativePath)
+        : [...current, relativePath]
+    );
+  }
+
+  function openEmailSelectedFiles() {
+    if (!claimDetail) {
+      return;
+    }
+    const defaultSubject = [claimDetail.claim_id, claimDetail.customer_name || claimDetail.title, "Claim Files"]
+      .filter(Boolean)
+      .join(" - ");
+    setEmailSubject(defaultSubject);
+    setEmailBody("Attached are the selected claim files.");
+    setEmailRecipientPickerOpen(false);
+    setEmailModalVisible(true);
+  }
+
+  function closeEmailModal() {
+    if (emailSending) {
+      return;
+    }
+    setEmailRecipientPickerOpen(false);
+    setEmailModalVisible(false);
+  }
+
+  function mergeEmailAddressList(currentValue, nextEmail) {
+    const normalizedNext = cleanString(nextEmail).toLowerCase();
+    if (!normalizedNext) {
+      return cleanString(currentValue);
+    }
+    const currentEntries = String(currentValue || "")
+      .split(",")
+      .map((entry) => cleanString(entry))
+      .filter(Boolean);
+    const seen = new Set(currentEntries.map((entry) => entry.toLowerCase()));
+    if (!seen.has(normalizedNext)) {
+      currentEntries.push(nextEmail);
+    }
+    return currentEntries.join(", ");
+  }
+
+  function applyCommonRecipient(recipient, destination = "to") {
+    if (!recipient?.email) {
+      return;
+    }
+    if (destination === "cc") {
+      setEmailCc((current) => mergeEmailAddressList(current, recipient.email));
+      return;
+    }
+    setEmailTo(recipient.email);
+    setEmailRecipientPickerOpen(false);
+  }
+
+  async function sendSelectedFilesEmail() {
+    if (!selectedClaimKey || !selectedPdfPaths.length) {
+      setError("Select at least one file first.");
+      return;
+    }
+    if (!emailTo.trim()) {
+      setError("Enter a recipient email first.");
+      return;
+    }
+    setEmailSending(true);
+    setError("");
+    try {
+      const payload = await fetchJson("/api/mobile/send-claim-files-email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          key: selectedClaimKey,
+          to: emailTo.trim(),
+          cc: emailCc.trim(),
+          subject: emailSubject.trim(),
+          body: emailBody,
+          paths: selectedPdfPaths,
+        }),
+      });
+      setUpdateMessage(
+        payload?.attachment_count
+          ? `${payload.attachment_count} file${payload.attachment_count === 1 ? "" : "s"} emailed to ${payload.sent_to}.`
+          : "Email sent."
+      );
+      setEmailModalVisible(false);
+      setSelectedPdfPaths([]);
+    } catch (err) {
+      handleError(err);
+    } finally {
+      setEmailSending(false);
     }
   }
 
@@ -496,11 +1123,84 @@ export default function App() {
     }
   }
 
+  async function uploadNewAssignmentPdf() {
+    if (assignmentUploadInFlight) {
+      return;
+    }
+    setError("");
+    setUpdateMessage("");
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: "application/pdf",
+        copyToCacheDirectory: true,
+        multiple: false,
+      });
+      if (result.canceled || !result.assets?.length) {
+        return;
+      }
+      const asset = result.assets[0];
+      if (!asset?.uri) {
+        throw new Error("No assignment PDF was selected.");
+      }
+      setAssignmentUploadInFlight(true);
+      setAssignmentUploadResult(null);
+      const formData = new FormData();
+      formData.append("assignment", {
+        uri: asset.uri,
+        name: asset.name || "assign.pdf",
+        type: asset.mimeType || "application/pdf",
+      });
+      const payload = await fetchJson("/api/mobile/upload-assignment-pdf", {
+        method: "POST",
+        body: formData,
+      });
+      setAssignmentUploadResult(payload);
+      const importedClaim = payload?.claim || null;
+      const importedLabel =
+        [importedClaim?.claim_id, importedClaim?.customer_name || importedClaim?.title]
+          .filter(Boolean)
+          .join(" - ") ||
+        payload?.folder_name ||
+        "Pending claim";
+      setUpdateMessage(`Assignment imported into ${importedLabel}.`);
+      if (importedClaim?.claim_id) {
+        setSearch(importedClaim.claim_id);
+      }
+      setClaimTab("open");
+      if (importedClaim?.key) {
+        setSelectedClaimKey(importedClaim.key);
+        await loadClaimDetail(importedClaim.key);
+        setDetailVisible(true);
+      }
+    } catch (err) {
+      handleError(err);
+    } finally {
+      setAssignmentUploadInFlight(false);
+    }
+  }
+
   function resetPhotoSessionState() {
     setPendingPhotoAsset(null);
     setPendingPhotoLabel("");
     setPhotoSessionUploads([]);
+    setPhotoZoom(0);
     setCameraReady(false);
+    setPhotoCaptureCueVisible(false);
+    setPhotoCaptureCueText("");
+  }
+
+  function showPhotoCaptureCue(label) {
+    if (photoCaptureCueTimeoutRef.current) {
+      clearTimeout(photoCaptureCueTimeoutRef.current);
+    }
+    Vibration.vibrate(90);
+    setPhotoCaptureCueText(label ? `${label} captured` : "Photo captured");
+    setPhotoCaptureCueVisible(true);
+    photoCaptureCueTimeoutRef.current = setTimeout(() => {
+      setPhotoCaptureCueVisible(false);
+      setPhotoCaptureCueText("");
+      photoCaptureCueTimeoutRef.current = null;
+    }, 1100);
   }
 
   async function closePhotoSession() {
@@ -511,8 +1211,25 @@ export default function App() {
     }
   }
 
+  function startLabeledPhotoCapture(label) {
+    setPendingPhotoLabel(label);
+    setPendingPhotoAsset(null);
+    setCameraReady(false);
+    setError("");
+  }
+
+  function returnToPhotoLabelPicker() {
+    setPendingPhotoLabel("");
+    setPendingPhotoAsset(null);
+    setCameraReady(false);
+  }
+
   async function capturePhotoForSession() {
     if (!selectedClaimKey) {
+      return;
+    }
+    if (!pendingPhotoLabel) {
+      setError("Pick a label first.");
       return;
     }
     if (!cameraPermission?.granted) {
@@ -535,9 +1252,31 @@ export default function App() {
       if (!result?.uri) {
         return;
       }
-
-      setPendingPhotoAsset(result);
-      setPendingPhotoLabel("");
+      showPhotoCaptureCue(pendingPhotoLabel);
+      setError("");
+      setUpdateMessage(`${pendingPhotoLabel} captured. Saving now...`);
+      const queuedItem = await stagePhotoForOfflineUpload(result, {
+        claimKey: selectedClaimKey,
+        label: pendingPhotoLabel,
+      });
+      const flushResult = await flushQueuedPhotoUploads({
+        specificIds: [queuedItem.id],
+        silent: true,
+      });
+      const uploadedItem = flushResult.uploaded.find((item) => item.id === queuedItem.id);
+      const savedName = uploadedItem?.savedName || queueUploadLabel(queuedItem);
+      startTransition(() => {
+        setPhotoSessionUploads((current) => [
+          uploadedItem ? savedName : `${savedName} (queued)`,
+          ...current,
+        ].slice(0, 12));
+      });
+      setUpdateMessage(
+        uploadedItem
+          ? `${savedName} saved.`
+          : `${savedName} queued on this phone until your reception is good enough to upload it.`
+      );
+      returnToPhotoLabelPicker();
     } catch (err) {
       handleError(err);
     } finally {
@@ -571,31 +1310,30 @@ export default function App() {
     try {
       setUploadingPhoto(true);
       setError("");
-      const uploadAsset = await prepareUploadPhoto(pendingPhotoAsset);
-      const formData = new FormData();
-      formData.append("photo", {
-        uri: uploadAsset.uri,
-        name: uploadAsset.name,
-        type: uploadAsset.type,
+      const queuedItem = await stagePhotoForOfflineUpload(pendingPhotoAsset, {
+        claimKey: selectedClaimKey,
+        label: pendingPhotoLabel,
       });
-
-      const payload = await fetchJson(
-        `/api/mobile/upload-photo?key=${encodeURIComponent(selectedClaimKey)}&label=${encodeURIComponent(pendingPhotoLabel)}`,
-        {
-          method: "POST",
-          body: formData,
-        }
-      );
-
-      const savedName = payload?.file?.name || pendingPhotoLabel;
+      const flushResult = await flushQueuedPhotoUploads({
+        specificIds: [queuedItem.id],
+        silent: true,
+      });
+      const uploadedItem = flushResult.uploaded.find((item) => item.id === queuedItem.id);
+      const savedName = uploadedItem?.savedName || queueUploadLabel(queuedItem);
       startTransition(() => {
-        setPhotoSessionUploads((current) => [savedName, ...current].slice(0, 12));
+        setPhotoSessionUploads((current) => [
+          uploadedItem ? savedName : `${savedName} (queued)`,
+          ...current,
+        ].slice(0, 12));
       });
       setCameraReady(false);
       setPendingPhotoAsset(null);
       setPendingPhotoLabel("");
-      setUpdateMessage(`${savedName} saved.`);
-      await loadClaimDetail(selectedClaimKey);
+      setUpdateMessage(
+        uploadedItem
+          ? `${savedName} saved.`
+          : `${savedName} queued on this phone until your reception is good enough to upload it.`
+      );
 
       if (finishAfter) {
         await closePhotoSession();
@@ -611,6 +1349,44 @@ export default function App() {
     setPendingPhotoAsset(null);
     setPendingPhotoLabel("");
     setCameraReady(false);
+  }
+
+  async function deleteClaimFile(file) {
+    if (!selectedClaimKey || !file?.relative_path) {
+      return;
+    }
+    Alert.alert(
+      "Delete File",
+      `Delete ${file.name}?`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              setError("");
+              const payload = await fetchJson("/api/mobile/delete-file", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ key: selectedClaimKey, path: file.relative_path }),
+              });
+              if (payload.claim) {
+                setClaimDetail(payload.claim);
+              } else {
+                await loadClaimDetail(selectedClaimKey);
+              }
+              startTransition(() => {
+                setSelectedPdfPaths((current) => current.filter((path) => path !== file.relative_path));
+              });
+              setUpdateMessage(`${file.name} deleted.`);
+            } catch (err) {
+              handleError(err);
+            }
+          },
+        },
+      ]
+    );
   }
 
   async function uploadPhotosFromLibrary() {
@@ -634,29 +1410,70 @@ export default function App() {
         return;
       }
 
+      const stagedItems = [];
       for (const asset of result.assets) {
-        const uploadAsset = await prepareUploadPhoto(asset);
-        const formData = new FormData();
-        formData.append("photo", {
-          uri: uploadAsset.uri,
-          name: uploadAsset.name,
-          type: uploadAsset.type,
+        const queuedItem = await stagePhotoForOfflineUpload(asset, {
+          claimKey: selectedClaimKey,
         });
-
-        await fetchJson(`/api/mobile/upload-photo?key=${encodeURIComponent(selectedClaimKey)}`, {
-          method: "POST",
-          body: formData,
-        });
+        stagedItems.push(queuedItem);
       }
 
-      setUpdateMessage(
-        result.assets.length > 1 ? `${result.assets.length} photos uploaded.` : "Photo uploaded."
-      );
-      await loadClaimDetail(selectedClaimKey);
+      const flushResult = await flushQueuedPhotoUploads({
+        specificIds: stagedItems.map((item) => item.id),
+        silent: true,
+      });
+      const uploadedCount = flushResult.uploaded.length;
+      const queuedCount = stagedItems.length - uploadedCount;
+
+      if (uploadedCount && queuedCount) {
+        setUpdateMessage(`${uploadedCount} photo${uploadedCount === 1 ? "" : "s"} uploaded, ${queuedCount} queued until signal improves.`);
+      } else if (uploadedCount) {
+        setUpdateMessage(
+          uploadedCount > 1 ? `${uploadedCount} photos uploaded.` : "Photo uploaded."
+        );
+      } else {
+        setUpdateMessage(
+          stagedItems.length > 1
+            ? `${stagedItems.length} photos queued on this phone until your reception is good enough to upload them.`
+            : "Photo queued on this phone until your reception is good enough to upload it."
+        );
+      }
     } catch (err) {
       handleError(err);
     } finally {
       setUploadingPhoto(false);
+    }
+  }
+
+  async function retryCurrentClaimQueuedUploads() {
+    if (!currentClaimQueuedUploads.length) {
+      return;
+    }
+    try {
+      setError("");
+      const result = await flushQueuedPhotoUploads({
+        specificIds: currentClaimQueuedUploads.map((item) => item.id),
+      });
+      if (!result.uploaded.length) {
+        setUpdateMessage("Still waiting on better reception to upload the queued photos.");
+      }
+    } catch (err) {
+      handleError(err);
+    }
+  }
+
+  async function retryAllQueuedUploads() {
+    if (!queuedPhotoUploads.length) {
+      return;
+    }
+    try {
+      setError("");
+      const result = await flushQueuedPhotoUploads();
+      if (!result.uploaded.length) {
+        setUpdateMessage("Still waiting on better reception to upload the queued photos.");
+      }
+    } catch (err) {
+      handleError(err);
     }
   }
 
@@ -774,6 +1591,30 @@ export default function App() {
     }
   }
 
+  async function openClaimLocation(address) {
+    const normalizedAddress = cleanString(address);
+    if (!normalizedAddress || normalizedAddress === "-") {
+      setError("No vehicle address is listed on this claim yet.");
+      return;
+    }
+    const geoUrl = `geo:0,0?q=${encodeURIComponent(normalizedAddress)}`;
+    const appleUrl = `http://maps.apple.com/?q=${encodeURIComponent(normalizedAddress)}`;
+    const googleUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(normalizedAddress)}`;
+    try {
+      if (Platform.OS === "android" && (await Linking.canOpenURL(geoUrl))) {
+        await Linking.openURL(geoUrl);
+        return;
+      }
+      if (Platform.OS === "ios" && (await Linking.canOpenURL(appleUrl))) {
+        await Linking.openURL(appleUrl);
+        return;
+      }
+      await Linking.openURL(googleUrl);
+    } catch {
+      setError("Could not open maps for this claim.");
+    }
+  }
+
   function startEditingRouteAddress(item) {
     setEditingRouteKey(item.key);
     setEditingRouteAddress(item.address || "");
@@ -816,18 +1657,23 @@ export default function App() {
       return [];
     }
     return [
-      ["Claim ID", claimDetail.claim_id],
-      ["Customer", claimDetail.customer_name || claimDetail.title],
-      ["Insurance", claimDetail.insurance_company],
-      ["Claim #", claimDetail.claim_number],
-      ["Status", claimDetail.status],
-      ["Type", claimDetail.claim_type],
-      ["Date Of Loss", claimDetail.date_of_loss],
-      ["Town", claimDetail.town],
-      ["Shop", claimDetail.shop_name],
-      ["Vehicle", claimDetail.vehicle],
-      ["VIN", claimDetail.vin],
-      ["Inspection Location", claimDetail.route_display_address],
+      { label: "Claim ID", value: claimDetail.claim_id },
+      { label: "Customer", value: claimDetail.customer_name || claimDetail.title },
+      {
+        label: "Phone",
+        value: formatPhone(claimDetail.contact_phone) || "No phone number listed",
+        phone: claimDetail.contact_phone,
+      },
+      { label: "Insurance", value: claimDetail.insurance_company },
+      { label: "Claim #", value: claimDetail.claim_number },
+      { label: "Status", value: claimDetail.status },
+      { label: "Type", value: claimDetail.claim_type },
+      { label: "Date Of Loss", value: claimDetail.date_of_loss },
+      { label: "Town", value: claimDetail.town },
+      { label: "Shop", value: claimDetail.shop_name },
+      { label: "Vehicle", value: claimDetail.vehicle },
+      { label: "VIN", value: claimDetail.vin },
+      { label: "Inspection Location", value: claimDetail.route_display_address },
     ];
   }, [claimDetail]);
 
@@ -859,6 +1705,33 @@ export default function App() {
     const recordMap = new Map(routeRecords.map((record) => [record.key, record]));
     return routePlanKeys.map((key) => recordMap.get(key)).filter(Boolean);
   }, [routePlanKeys, routeRecords]);
+
+  useEffect(() => {
+    if (!apiReady) {
+      return;
+    }
+    const targets = [...claimRecords, ...plannedRouteRecords]
+      .filter((item) => item?.key && !resolvedPhoneForRecord(item))
+      .slice(0, 40);
+    if (!targets.length) {
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      for (const item of targets) {
+        if (cancelled) {
+          return;
+        }
+        try {
+          await ensureClaimPhone(item.key);
+        } catch {
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [apiReady, claimRecords, plannedRouteRecords, claimPhoneMap]);
 
   const availableRouteRecords = useMemo(() => {
     const selectedKeys = new Set(routePlanKeys);
@@ -892,11 +1765,11 @@ export default function App() {
 
   return (
     <SafeAreaView style={styles.safe}>
-      <ExpoStatusBar style="dark" />
+      <ExpoStatusBar style="dark" backgroundColor="#eef4fb" translucent={false} />
       <View style={styles.shell}>
         <View style={styles.headerTop}>
           <View style={styles.header}>
-            <Text style={styles.eyebrow}>Fernando Marin</Text>
+            <Text style={styles.eyebrow}>{APP_OWNER_LABEL}</Text>
             <Text style={styles.title}>Claim Manager Companion</Text>
             <Text style={styles.subtitle}>
               Field access for claims, files, notes, routes, and photo upload.
@@ -916,6 +1789,14 @@ export default function App() {
               {apiBase.replace(/^https?:\/\//, "")}
             </Text>
           </View>
+          {queuedPhotoUploads.length ? (
+            <Pressable style={[styles.statusChip, styles.pendingStatusChip]} onPress={retryAllQueuedUploads}>
+              <Text style={styles.statusChipLabel}>Queued</Text>
+              <Text style={styles.statusChipValue} numberOfLines={1}>
+                {queueFlushing ? "Uploading..." : `${queuedPhotoUploads.length} photo${queuedPhotoUploads.length === 1 ? "" : "s"}`}
+              </Text>
+            </Pressable>
+          ) : null}
           {updateMessage ? (
             <Text style={styles.statusMessage} numberOfLines={1}>
               {updateMessage}
@@ -935,20 +1816,22 @@ export default function App() {
           ))}
         </View>
 
-        <TextInput
-          value={search}
-          onChangeText={setSearch}
-          autoCapitalize="none"
-          autoCorrect={false}
-          style={styles.search}
-          placeholder={
-            homeTab === "library"
-              ? "Search library..."
-              : homeTab === "route"
-                ? "Search any claim for your route..."
-                : "Search claims, insurance, town, shop..."
-          }
-        />
+        {!(homeTab === "claims" && claimTab === "new") ? (
+          <TextInput
+            value={search}
+            onChangeText={setSearch}
+            autoCapitalize="none"
+            autoCorrect={false}
+            style={styles.search}
+            placeholder={
+              homeTab === "library"
+                ? "Search library..."
+                : homeTab === "route"
+                  ? "Search any claim for your route..."
+                  : "Search claims, insurance, town, shop..."
+            }
+          />
+        ) : null}
 
         {homeTab === "claims" ? (
           <>
@@ -958,7 +1841,9 @@ export default function App() {
               ))}
             </View>
             <Text style={styles.inlineHint}>
-              Tap any claim to open files, photos, notes, and quick actions.
+              {claimTab === "new"
+                ? "Pick a new assignment PDF from your phone and send it to the Home PC so it creates the pending claim folder for you."
+                : "Tap any claim to open files, photos, notes, and quick actions."}
             </Text>
           </>
         ) : null}
@@ -1012,20 +1897,27 @@ export default function App() {
             </View>
 
             <View style={styles.utilityCard}>
-              <Text style={styles.utilityHint}>Use the secure Cloudflare address by default, or switch back to local if you are on the same network.</Text>
+              <Text style={styles.utilityHint}>{CONNECTION_HINT}</Text>
               <Text style={styles.helperStrong}>{currentVersionLabel}</Text>
               <Text style={styles.helper}>{currentVersionDetail}</Text>
-              <TextInput
-                value={apiBase}
-                onChangeText={setApiBase}
-                autoCapitalize="none"
-                autoCorrect={false}
-                style={styles.input}
-                placeholder="https://api2.luxuryimportsusa.shop"
+              {CONNECTION_LOCKED ? (
+                <View style={styles.input}>
+                  <Text style={styles.helperStrong}>{apiBase}</Text>
+                </View>
+              ) : (
+                <TextInput
+                  value={apiBase}
+                  onChangeText={setApiBase}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  style={styles.input}
+                  placeholder="https://api.luxuryimportsusa.shop"
                 />
-                <Text style={styles.helper}>
-                  Public address: https://api2.luxuryimportsusa.shop
-                </Text>
+              )}
+              <Text style={styles.helper}>Public address: {API_BASE_DEFAULT}</Text>
+              {API_BASE_FALLBACKS.length ? (
+                <Text style={styles.helper}>Fallbacks: {API_BASE_FALLBACKS.join(", ")}</Text>
+              ) : null}
               {updateMessage ? <Text style={styles.helper}>{updateMessage}</Text> : null}
             </View>
           </SafeAreaView>
@@ -1053,8 +1945,26 @@ export default function App() {
               <ScrollView contentContainerStyle={styles.scrollPad}>
                 <View style={styles.card}>
                   <Text style={styles.section}>{claimDetail.customer_name || claimDetail.title || "Claim"}</Text>
-                  {detailRows.map(([label, value]) => (
-                    <FieldRow key={label} label={label} value={value} />
+                  {detailRows.map((row) => (
+                    <FieldRow
+                      key={row.label}
+                      label={row.label}
+                      value={row.value}
+                      onPress={
+                        row.label === "Phone"
+                          ? () => promptPhoneActions(row.phone, claimDetail.customer_name || claimDetail.title)
+                          : row.label === "Inspection Location"
+                            ? () => openClaimLocation(row.value)
+                          : undefined
+                      }
+                      onLongPress={
+                        row.label === "Phone"
+                          ? () => promptPhoneActions(row.phone, claimDetail.customer_name || claimDetail.title)
+                          : row.label === "Inspection Location"
+                            ? () => openClaimLocation(row.value)
+                          : undefined
+                      }
+                    />
                   ))}
                 </View>
 
@@ -1072,6 +1982,21 @@ export default function App() {
                   <Text style={styles.helper}>
                     Save photos straight into this claim folder on your PC. The photo session keeps you in a continuous capture flow.
                   </Text>
+                  {currentClaimQueuedUploads.length ? (
+                    <View style={styles.queueNotice}>
+                      <Text style={styles.queueNoticeTitle}>
+                        {currentClaimQueuedUploads.length} photo{currentClaimQueuedUploads.length === 1 ? "" : "s"} waiting on this phone
+                      </Text>
+                      <Text style={styles.helper}>
+                        Reception was not good enough yet. These photos are stored locally and will upload automatically when the connection is strong enough.
+                      </Text>
+                      <Action
+                        label={queueFlushing ? "Uploading..." : "Retry Pending Uploads"}
+                        onPress={retryCurrentClaimQueuedUploads}
+                        disabled={queueFlushing}
+                      />
+                    </View>
+                  ) : null}
                   <View style={styles.photoRow}>
                     <Action
                       label={uploadingPhoto ? "Working..." : "Take Photos"}
@@ -1103,12 +2028,50 @@ export default function App() {
 
                 <View style={styles.card}>
                   <Text style={styles.section}>Files In Claim Folder</Text>
+                  <Text style={styles.helper}>
+                    Select PDF or photo files you want to email from this claim folder, then send them from the Home PC.
+                  </Text>
+                  <View style={styles.stack}>
+                    <Action
+                      label={emailSending ? "Sending..." : "Email Selected Files"}
+                      primary
+                      onPress={openEmailSelectedFiles}
+                      disabled={!selectedPdfPaths.length || emailSending}
+                    />
+                  </View>
                   {(claimDetail.files || []).length ? (
                     claimDetail.files.map((file) => (
-                      <Pressable key={file.relative_path} style={styles.listItem} onPress={() => Linking.openURL(file.file_url)}>
-                        <Text style={styles.itemTitle}>{file.name}</Text>
-                        <Text style={styles.itemMeta}>{file.relative_path}</Text>
-                      </Pressable>
+                      <View key={file.relative_path} style={[styles.listItem, styles.fileListItem]}>
+                        <Pressable style={styles.fileMainArea} onPress={() => Linking.openURL(file.file_url)}>
+                          <Text style={styles.itemTitle}>{file.name}</Text>
+                          <Text style={styles.itemMeta}>{file.relative_path}</Text>
+                        </Pressable>
+                        <View style={styles.fileActionColumn}>
+                          {isEmailableFile(file) ? (
+                            <Pressable
+                              onPress={() => togglePdfSelection(file.relative_path)}
+                              style={[
+                                styles.fileSelectChip,
+                                selectedPdfPaths.includes(file.relative_path) && styles.fileSelectChipActive,
+                              ]}
+                            >
+                              <Text
+                                style={[
+                                  styles.fileSelectChipText,
+                                  selectedPdfPaths.includes(file.relative_path) && styles.fileSelectChipTextActive,
+                                ]}
+                              >
+                                {selectedPdfPaths.includes(file.relative_path) ? "Selected" : "Select File"}
+                              </Text>
+                            </Pressable>
+                          ) : (
+                            <Text style={styles.fileNonPdfHint}>Open only</Text>
+                          )}
+                          <Pressable style={styles.fileDeleteChip} onPress={() => deleteClaimFile(file)}>
+                            <Text style={styles.fileDeleteChipText}>Delete</Text>
+                          </Pressable>
+                        </View>
+                      </View>
                     ))
                   ) : (
                     <Text style={styles.helper}>No files found in this claim folder.</Text>
@@ -1118,6 +2081,110 @@ export default function App() {
             )}
           </View>
         </SafeAreaView>
+      </Modal>
+
+      <Modal visible={emailModalVisible} animationType="slide" transparent onRequestClose={closeEmailModal}>
+        <View style={styles.sheetBackdrop}>
+          <Pressable style={styles.sheetDismiss} onPress={closeEmailModal} />
+          <SafeAreaView style={styles.sheetCard}>
+            <View style={styles.modalHead}>
+              <Pressable style={styles.smallBtn} onPress={closeEmailModal} disabled={emailSending}>
+                <Text style={styles.smallBtnText}>Close</Text>
+              </Pressable>
+              <Text style={styles.modalTitle}>Email Files</Text>
+              <Action
+                label={emailSending ? "..." : "Send"}
+                primary
+                compact
+                onPress={sendSelectedFilesEmail}
+                disabled={emailSending || !selectedPdfPaths.length}
+              />
+            </View>
+
+            <View style={styles.utilityCard}>
+              <Text style={styles.helperStrong}>
+                {selectedPdfPaths.length} file{selectedPdfPaths.length === 1 ? "" : "s"} selected
+              </Text>
+              <TextInput
+                value={emailTo}
+                onChangeText={setEmailTo}
+                autoCapitalize="none"
+                autoCorrect={false}
+                keyboardType="email-address"
+                style={styles.input}
+                placeholder="To"
+              />
+              <View style={styles.recipientPickerWrap}>
+                <Pressable
+                  style={styles.recipientPickerToggle}
+                  onPress={() => setEmailRecipientPickerOpen((current) => !current)}
+                >
+                  <Text style={styles.recipientPickerToggleText}>
+                    {emailRecipientPickerOpen ? "Hide Common Recipients" : "Common Recipients"}
+                  </Text>
+                </Pressable>
+                {emailRecipientPickerOpen ? (
+                  <View style={styles.recipientPickerMenu}>
+                    <Text style={styles.helper}>Tap a name to fill To, or add them to Cc.</Text>
+                    {COMMON_EMAIL_RECIPIENTS.map((recipient) => (
+                      <View key={recipient.email} style={styles.recipientPickerRow}>
+                        <View style={styles.recipientPickerInfo}>
+                          <Text style={styles.recipientPickerName}>{recipient.label}</Text>
+                          <Text style={styles.recipientPickerEmail}>{recipient.email}</Text>
+                        </View>
+                        <View style={styles.recipientPickerActions}>
+                          <Pressable
+                            style={styles.recipientPickerChip}
+                            onPress={() => applyCommonRecipient(recipient, "to")}
+                          >
+                            <Text style={styles.recipientPickerChipText}>To</Text>
+                          </Pressable>
+                          <Pressable
+                            style={styles.recipientPickerChip}
+                            onPress={() => applyCommonRecipient(recipient, "cc")}
+                          >
+                            <Text style={styles.recipientPickerChipText}>Cc</Text>
+                          </Pressable>
+                        </View>
+                      </View>
+                    ))}
+                  </View>
+                ) : null}
+              </View>
+              <TextInput
+                value={emailCc}
+                onChangeText={setEmailCc}
+                autoCapitalize="none"
+                autoCorrect={false}
+                keyboardType="email-address"
+                style={styles.input}
+                placeholder="Cc (optional)"
+              />
+              <TextInput
+                value={emailSubject}
+                onChangeText={setEmailSubject}
+                autoCapitalize="sentences"
+                autoCorrect={true}
+                style={styles.input}
+                placeholder="Subject"
+              />
+              <TextInput
+                value={emailBody}
+                onChangeText={setEmailBody}
+                multiline
+                style={styles.notesInput}
+                placeholder="Message"
+              />
+              <View style={styles.emailSelectionList}>
+                {selectedPdfPaths.map((path) => (
+                  <Text key={path} style={styles.emailSelectionItem}>
+                    {path}
+                  </Text>
+                ))}
+              </View>
+            </View>
+          </SafeAreaView>
+        </View>
       </Modal>
 
       <Modal visible={photoSessionVisible} animationType="slide" onRequestClose={closePhotoSession}>
@@ -1139,11 +2206,21 @@ export default function App() {
                 <Text style={styles.helper}>
                   The rear camera opens first. After each shot, pick the photo label, save it, and keep going until you are done.
                 </Text>
+                {photoCaptureCueVisible ? (
+                  <View style={styles.captureCueBanner}>
+                    <Text style={styles.captureCueText}>{photoCaptureCueText || "Photo captured"}</Text>
+                  </View>
+                ) : null}
                 <Text style={styles.helperStrong}>
                   {photoSessionUploads.length
                     ? `${photoSessionUploads.length} photo${photoSessionUploads.length === 1 ? "" : "s"} saved in this session.`
                     : "No photos saved in this session yet."}
                 </Text>
+                {currentClaimQueuedUploads.length ? (
+                  <Text style={styles.helper}>
+                    {currentClaimQueuedUploads.length} photo{currentClaimQueuedUploads.length === 1 ? "" : "s"} currently stored on this phone and waiting for better reception before uploading.
+                  </Text>
+                ) : null}
                 {photoSessionUploads.length ? (
                   <View style={styles.photoSessionSavedList}>
                     {photoSessionUploads.map((name) => (
@@ -1155,92 +2232,100 @@ export default function App() {
                 ) : null}
               </View>
 
-              {pendingPhotoAsset ? (
+              {!pendingPhotoLabel ? (
                 <View style={styles.card}>
-                  <Text style={styles.section}>Label This Photo</Text>
-                  <Image source={{ uri: pendingPhotoAsset.uri }} style={styles.photoPreview} />
+                  <Text style={styles.section}>Choose Photo Label</Text>
                   <Text style={styles.helper}>
-                    Pick the name for this photo. If the same label is used again, the app will number it automatically.
+                    Pick the label first, take the photo, and the app will bring you right back here for the next one.
                   </Text>
                   <View style={styles.photoLabelGrid}>
                     {PHOTO_LABEL_OPTIONS.map((label) => (
                       <Pressable
                         key={label}
-                        onPress={() => setPendingPhotoLabel(label)}
-                        style={[
-                          styles.photoLabelChip,
-                          pendingPhotoLabel === label && styles.photoLabelChipActive,
-                        ]}
+                        onPress={() => startLabeledPhotoCapture(label)}
+                        style={styles.photoLabelChip}
                       >
-                        <Text
-                          style={[
-                            styles.photoLabelChipText,
-                            pendingPhotoLabel === label && styles.photoLabelChipTextActive,
-                          ]}
-                        >
-                          {label}
-                        </Text>
+                        <Text style={styles.photoLabelChipText}>{label}</Text>
                       </Pressable>
                     ))}
                   </View>
                   <View style={styles.stack}>
-                    <Action
-                      label={uploadingPhoto ? "Saving..." : "Save & Next Photo"}
-                      primary
-                      onPress={() => savePendingPhoto()}
-                      disabled={uploadingPhoto || !pendingPhotoLabel}
-                    />
-                    <Action
-                      label={uploadingPhoto ? "Saving..." : "Save & Finish"}
-                      onPress={() => savePendingPhoto({ finishAfter: true })}
-                      disabled={uploadingPhoto || !pendingPhotoLabel}
-                    />
-                    <Action
-                      label={uploadingPhoto ? "Working..." : "Retake Photo"}
-                      onPress={retakePendingPhoto}
-                      disabled={uploadingPhoto}
-                    />
+                    <Action label="Finished" onPress={closePhotoSession} disabled={uploadingPhoto} />
                   </View>
                 </View>
               ) : (
                 <View style={styles.card}>
                   <Text style={styles.section}>Capture</Text>
+                  <Text style={styles.helperStrong}>Current Label: {pendingPhotoLabel}</Text>
                   {cameraPermission?.granted ? (
                     <>
                       <Text style={styles.helper}>
-                        Stay in this screen while working. The camera below is locked to the rear lens.
+                        Take the photo and it will save immediately under this label, then return to the label picker.
                       </Text>
+                      <View style={styles.zoomRow}>
+                        <Text style={styles.zoomLabel}>Zoom</Text>
+                        <View style={styles.zoomChipRow}>
+                          {PHOTO_ZOOM_OPTIONS.map((option) => (
+                            <Pressable
+                              key={option.label}
+                              onPress={() => setPhotoZoom(option.value)}
+                              style={[
+                                styles.zoomChip,
+                                photoZoom === option.value && styles.zoomChipActive,
+                              ]}
+                            >
+                              <Text
+                                style={[
+                                  styles.zoomChipText,
+                                  photoZoom === option.value && styles.zoomChipTextActive,
+                                ]}
+                              >
+                                {option.label}
+                              </Text>
+                            </Pressable>
+                          ))}
+                        </View>
+                      </View>
                       <View style={styles.cameraWrap}>
                         <CameraView
                           ref={cameraRef}
                           style={styles.cameraPreview}
                           facing="back"
                           mode="picture"
+                          zoom={photoZoom}
+                          autofocus={Platform.OS === "ios" ? "on" : undefined}
                           active={photoSessionVisible && !pendingPhotoAsset}
                           onCameraReady={() => setCameraReady(true)}
                           onMountError={(event) => handleError(new Error(event?.message || "Camera could not start."))}
                         />
+                        {photoCaptureCueVisible ? (
+                          <>
+                            <View style={styles.cameraCaptureFlash} pointerEvents="none" />
+                            <View style={styles.cameraCaptureBadgeWrap} pointerEvents="none">
+                              <View style={styles.cameraCaptureBadge}>
+                                <Text style={styles.cameraCaptureBadgeText}>
+                                  {photoCaptureCueText || "Photo captured"}
+                                </Text>
+                              </View>
+                            </View>
+                          </>
+                        ) : null}
                       </View>
                       <View style={styles.stack}>
                         <Action
                           label={
                             uploadingPhoto
-                              ? "Capturing..."
+                              ? "Saving..."
                               : !cameraReady
                                 ? "Loading Camera..."
-                                : photoSessionUploads.length
-                                  ? "Take Next Photo"
-                                  : "Take First Photo"
+                                : "Take Photo"
                           }
                           primary
                           onPress={capturePhotoForSession}
                           disabled={uploadingPhoto || !cameraReady}
                         />
-                        <Action
-                          label="Done With Photos"
-                          onPress={closePhotoSession}
-                          disabled={uploadingPhoto}
-                        />
+                        <Action label="Change Label" onPress={returnToPhotoLabelPicker} disabled={uploadingPhoto} />
+                        <Action label="Finished" onPress={closePhotoSession} disabled={uploadingPhoto} />
                       </View>
                     </>
                   ) : (
@@ -1249,7 +2334,7 @@ export default function App() {
                         Camera permission is needed before you can take claim photos in the app.
                       </Text>
                       <Action label="Allow Camera" primary onPress={openPhotoSession} disabled={uploadingPhoto} />
-                      <Action label="Done With Photos" onPress={closePhotoSession} disabled={uploadingPhoto} />
+                      <Action label="Finished" onPress={closePhotoSession} disabled={uploadingPhoto} />
                     </View>
                   )}
                 </View>
@@ -1263,6 +2348,51 @@ export default function App() {
 
   function renderContent() {
     if (homeTab === "claims") {
+      if (claimTab === "new") {
+        return (
+          <ScrollView contentContainerStyle={styles.scrollPad}>
+            <View style={styles.card}>
+              <Text style={styles.section}>New Assignment</Text>
+              <Text style={styles.helper}>
+                Pick the assignment PDF from your phone. The Home PC will drop it into `PENDING CLAIMS`,
+                run the same refresh-scan organizer, create the proper folder name, and populate the claim.
+              </Text>
+              <View style={styles.stack}>
+                <Action
+                  label={assignmentUploadInFlight ? "Importing..." : "Pick Assignment PDF"}
+                  primary
+                  onPress={uploadNewAssignmentPdf}
+                  disabled={assignmentUploadInFlight}
+                />
+              </View>
+            </View>
+            {assignmentUploadResult ? (
+              <View style={styles.card}>
+                <Text style={styles.section}>Last Import</Text>
+                <Text style={styles.helperStrong}>
+                  {assignmentUploadResult.claim?.claim_id || "New claim imported"}
+                </Text>
+                <Text style={styles.helper}>
+                  {(assignmentUploadResult.claim?.customer_name || assignmentUploadResult.claim?.title || "-") +
+                    (assignmentUploadResult.folder_name
+                      ? `\nFolder: ${assignmentUploadResult.folder_name}`
+                      : "")}
+                </Text>
+                {assignmentUploadResult.claim?.key ? (
+                  <Action
+                    label="Open Imported Claim"
+                    onPress={async () => {
+                      setSelectedClaimKey(assignmentUploadResult.claim.key);
+                      await loadClaimDetail(assignmentUploadResult.claim.key);
+                      setDetailVisible(true);
+                    }}
+                  />
+                ) : null}
+              </View>
+            ) : null}
+          </ScrollView>
+        );
+      }
       return (
         <View style={styles.cardFill}>
           <FlatList
@@ -1277,6 +2407,7 @@ export default function App() {
                   setSelectedClaimKey(item.key);
                   setDetailVisible(true);
                 }}
+                onLongPress={() => promptPhoneActionsForRecord(item, item.customer_name || item.title)}
               >
                 <Text style={styles.itemTitle}>
                   {[item.claim_id || "-", item.customer_name || item.title || "-"].join(BULLET)}
@@ -1287,6 +2418,9 @@ export default function App() {
                 <Text style={styles.itemMeta}>{item.insurance_company || "-"}</Text>
                 <Text style={styles.itemMeta}>
                   {[item.vehicle, item.shop_name, item.town].filter(Boolean).join(BULLET) || "-"}
+                </Text>
+                <Text style={[styles.itemMeta, styles.phoneMeta]}>
+                  Phone: {formatPhone(resolvedPhoneForRecord(item)) || "No phone number listed"}
                 </Text>
               </Pressable>
             )}
@@ -1354,6 +2488,7 @@ export default function App() {
                   item={item}
                   badge={`Stop ${index + 1}`}
                   onPress={() => openRouteClaim(item.key)}
+                  onPhonePress={() => promptPhoneActionsForRecord(item, item.customer_name)}
                   actions={[
                     {
                       label: "Up",
@@ -1422,6 +2557,7 @@ export default function App() {
                   key={item.key}
                   item={item}
                   onPress={() => openRouteClaim(item.key)}
+                  onPhonePress={() => promptPhoneActionsForRecord(item, item.customer_name)}
                   actions={[
                     {
                       label: "Add",
@@ -1535,13 +2671,21 @@ function Chip({ label, active, onPress }) {
   );
 }
 
-function FieldRow({ label, value }) {
-  return (
-    <View style={styles.fieldRow}>
+function FieldRow({ label, value, onPress, onLongPress }) {
+  const content = (
+    <>
       <Text style={styles.fieldLabel}>{label}</Text>
-      <Text style={styles.fieldValue}>{value || "-"}</Text>
-    </View>
+      <Text style={[styles.fieldValue, (onPress || onLongPress) && styles.fieldValueAction]}>{value || "-"}</Text>
+    </>
   );
+  if (onPress || onLongPress) {
+    return (
+      <Pressable style={styles.fieldRow} onPress={onPress} onLongPress={onLongPress}>
+        {content}
+      </Pressable>
+    );
+  }
+  return <View style={styles.fieldRow}>{content}</View>;
 }
 
 function Action({ label, primary, onPress, compact, disabled }) {
@@ -1563,11 +2707,11 @@ function Action({ label, primary, onPress, compact, disabled }) {
   );
 }
 
-function RouteRow({ item, onPress, badge, actions = [], editor = null }) {
+function RouteRow({ item, onPress, onPhonePress, badge, actions = [], editor = null }) {
   return (
     <View style={styles.listItem}>
       {badge ? <Text style={styles.routeBadge}>{badge}</Text> : null}
-      <Pressable onPress={onPress}>
+      <Pressable onPress={onPress} onLongPress={onPhonePress}>
         <Text style={styles.itemTitle}>{[item.claim_id || "-", item.customer_name || "-"].join(BULLET)}</Text>
         {item.needs_measurement_photos ? (
           <Text style={styles.measurementFlag}>MEASUREMENT PHOTOS REQUIRED</Text>
@@ -1577,6 +2721,9 @@ function RouteRow({ item, onPress, badge, actions = [], editor = null }) {
           {[item.status_label || item.status, item.shop_name, item.insurance_company, item.vehicle]
             .filter(Boolean)
             .join(BULLET) || "-"}
+        </Text>
+        <Text style={[styles.itemMeta, styles.phoneMeta]}>
+          Phone: {formatPhone(item.contact_phone) || "No phone number listed"}
         </Text>
       </Pressable>
       {actions.length ? (
@@ -1632,64 +2779,64 @@ const styles = StyleSheet.create({
   },
   shell: {
     flex: 1,
-    paddingHorizontal: 14,
-    paddingTop: Platform.OS === "android" ? (NativeStatusBar.currentHeight || 0) + 8 : 6,
+    paddingHorizontal: scaleUi(12),
+    paddingTop: Platform.OS === "android" ? (NativeStatusBar.currentHeight || 0) + scaleUi(16) : scaleUi(10),
     paddingBottom: 0,
-    gap: 6,
+    gap: scaleUi(6),
   },
   headerTop: {
     flexDirection: "row",
     alignItems: "flex-start",
     justifyContent: "space-between",
-    gap: 10,
+    gap: scaleUi(8),
   },
   header: {
     flex: 1,
     gap: 0,
   },
   eyebrow: {
-    fontSize: 10,
+    fontSize: scaleUi(9),
     color: "#6a7f9d",
     fontWeight: "700",
     textTransform: "uppercase",
     letterSpacing: 1.2,
   },
   title: {
-    fontSize: 17,
+    fontSize: scaleUi(15),
     fontWeight: "800",
     color: "#0f2742",
   },
   subtitle: {
-    fontSize: 11,
+    fontSize: scaleUi(10),
     color: "#5d718d",
-    lineHeight: 16,
+    lineHeight: scaleUi(14),
   },
   versionText: {
-    marginTop: 6,
-    fontSize: 12,
+    marginTop: scaleUi(4),
+    fontSize: scaleUi(11),
     fontWeight: "800",
     color: "#b42318",
   },
   versionSubtext: {
-    fontSize: 10,
+    fontSize: scaleUi(9),
     color: "#6a7f9d",
     fontWeight: "700",
   },
   card: {
     backgroundColor: "#ffffff",
-    borderRadius: 20,
-    padding: 16,
+    borderRadius: scaleUi(18),
+    padding: scaleUi(14),
     borderWidth: 1,
     borderColor: "#d7e1ee",
-    gap: 10,
+    gap: scaleUi(8),
   },
   utilityCard: {
     backgroundColor: "#ffffff",
-    borderRadius: 18,
-    padding: 12,
+    borderRadius: scaleUi(16),
+    padding: scaleUi(10),
     borderWidth: 1,
     borderColor: "#d7e1ee",
-    gap: 8,
+    gap: scaleUi(6),
   },
   statusRow: {
     flexDirection: "row",
@@ -1700,20 +2847,23 @@ const styles = StyleSheet.create({
   statusChip: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 6,
+    gap: scaleUi(6),
     backgroundColor: "#ffffff",
     borderRadius: 999,
-    paddingHorizontal: 10,
-    paddingVertical: 5,
+    paddingHorizontal: scaleUi(9),
+    paddingVertical: scaleUi(4),
     borderWidth: 1,
     borderColor: "#d7e1ee",
-    maxWidth: 210,
+    maxWidth: scaleUi(190),
+  },
+  pendingStatusChip: {
+    maxWidth: scaleUi(168),
   },
   contentWrap: {
     flex: 1,
   },
   statusChipLabel: {
-    fontSize: 10,
+    fontSize: scaleUi(9),
     fontWeight: "800",
     color: "#6b809d",
     textTransform: "uppercase",
@@ -1721,13 +2871,13 @@ const styles = StyleSheet.create({
   },
   statusChipValue: {
     flex: 1,
-    fontSize: 11,
+    fontSize: scaleUi(10),
     color: "#183659",
     fontWeight: "600",
   },
   statusMessage: {
     flex: 1,
-    fontSize: 11,
+    fontSize: scaleUi(10),
     color: "#6b809d",
   },
   utilityHeader: {
@@ -1810,12 +2960,12 @@ const styles = StyleSheet.create({
     fontWeight: "700",
   },
   helper: {
-    fontSize: 13,
+    fontSize: scaleUi(12),
     color: "#6e84a3",
-    lineHeight: 18,
+    lineHeight: scaleUi(16),
   },
   helperStrong: {
-    fontSize: 12,
+    fontSize: scaleUi(11),
     fontWeight: "800",
     color: "#183659",
   },
@@ -1823,20 +2973,20 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#cad7e8",
     backgroundColor: "#fbfdff",
-    borderRadius: 14,
-    paddingHorizontal: 14,
-    paddingVertical: 11,
-    fontSize: 15,
+    borderRadius: scaleUi(12),
+    paddingHorizontal: scaleUi(12),
+    paddingVertical: scaleUi(9),
+    fontSize: scaleUi(13),
     color: "#10253f",
   },
   search: {
     borderWidth: 1,
     borderColor: "#cad7e8",
     backgroundColor: "#ffffff",
-    borderRadius: 15,
-    paddingHorizontal: 15,
-    paddingVertical: 9,
-    fontSize: 13,
+    borderRadius: scaleUi(13),
+    paddingHorizontal: scaleUi(13),
+    paddingVertical: scaleUi(8),
+    fontSize: scaleUi(12),
     color: "#10253f",
   },
   tabRow: {
@@ -1845,9 +2995,9 @@ const styles = StyleSheet.create({
     gap: 5,
   },
   chip: {
-    minWidth: 68,
-    paddingHorizontal: 11,
-    paddingVertical: 6,
+    minWidth: scaleUi(62),
+    paddingHorizontal: scaleUi(10),
+    paddingVertical: scaleUi(5),
     borderRadius: 999,
     backgroundColor: "#e7eef7",
     alignItems: "center",
@@ -1857,7 +3007,7 @@ const styles = StyleSheet.create({
   },
   chipText: {
     color: "#35506f",
-    fontSize: 11,
+    fontSize: scaleUi(10),
     fontWeight: "700",
   },
   chipTextOn: {
@@ -1888,7 +3038,7 @@ const styles = StyleSheet.create({
     borderColor: "#d7e1ee",
   },
   loadingPillText: {
-    fontSize: 12,
+    fontSize: scaleUi(11),
     fontWeight: "700",
     color: "#35506f",
   },
@@ -1901,21 +3051,71 @@ const styles = StyleSheet.create({
   },
   errorText: {
     color: "#8f2c2c",
-    fontSize: 14,
-    lineHeight: 20,
+    fontSize: scaleUi(12),
+    lineHeight: scaleUi(18),
   },
   listItem: {
-    marginHorizontal: 10,
-    marginVertical: 4,
-    paddingHorizontal: 13,
-    paddingVertical: 10,
+    marginHorizontal: scaleUi(8),
+    marginVertical: scaleUi(3),
+    paddingHorizontal: scaleUi(11),
+    paddingVertical: scaleUi(8),
     backgroundColor: "#ffffff",
-    borderRadius: 16,
+    borderRadius: scaleUi(14),
     borderWidth: 1,
     borderColor: "#e1e9f3",
   },
+  fileListItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  fileMainArea: {
+    flex: 1,
+  },
+  fileActionColumn: {
+    alignItems: "flex-end",
+    gap: 8,
+  },
+  fileSelectChip: {
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: "#edf3fa",
+    borderWidth: 1,
+    borderColor: "#d5e0ee",
+  },
+  fileSelectChipActive: {
+    backgroundColor: "#103c6d",
+    borderColor: "#103c6d",
+  },
+  fileSelectChipText: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#17395d",
+  },
+  fileSelectChipTextActive: {
+    color: "#ffffff",
+  },
+  fileNonPdfHint: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#6e84a3",
+  },
+  fileDeleteChip: {
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: "#fdecec",
+    borderWidth: 1,
+    borderColor: "#f2bbbb",
+  },
+  fileDeleteChipText: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#a03333",
+  },
   itemTitle: {
-    fontSize: 14,
+    fontSize: scaleUi(12.5),
     fontWeight: "700",
     color: "#10253f",
   },
@@ -1934,10 +3134,14 @@ const styles = StyleSheet.create({
     borderColor: "#f4b8b8",
   },
   itemMeta: {
-    marginTop: 4,
-    fontSize: 11,
-    lineHeight: 16,
+    marginTop: scaleUi(3),
+    fontSize: scaleUi(10),
+    lineHeight: scaleUi(14),
     color: "#5d718d",
+  },
+  phoneMeta: {
+    color: "#0e3a66",
+    fontWeight: "800",
   },
   sep: {
     height: 0,
@@ -1948,27 +3152,27 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
   },
   modalTitle: {
-    fontSize: 20,
+    fontSize: scaleUi(17),
     fontWeight: "800",
     color: "#10253f",
   },
   smallBtn: {
     backgroundColor: "#e8eef7",
-    borderRadius: 14,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
+    borderRadius: scaleUi(12),
+    paddingHorizontal: scaleUi(12),
+    paddingVertical: scaleUi(8),
   },
   smallBtnText: {
     color: "#14385f",
     fontWeight: "700",
-    fontSize: 14,
+    fontSize: scaleUi(12),
   },
   scrollPad: {
     paddingBottom: 24,
     gap: 12,
   },
   section: {
-    fontSize: 20,
+    fontSize: scaleUi(17),
     fontWeight: "800",
     color: "#10253f",
   },
@@ -2004,32 +3208,36 @@ const styles = StyleSheet.create({
     marginBottom: 2,
   },
   fieldLabel: {
-    fontSize: 13,
+    fontSize: scaleUi(11),
     color: "#6e84a3",
     fontWeight: "700",
     textTransform: "uppercase",
     letterSpacing: 0.8,
   },
   fieldValue: {
-    marginTop: 4,
-    fontSize: 18,
+    marginTop: scaleUi(3),
+    fontSize: scaleUi(15),
     color: "#10253f",
-    lineHeight: 24,
+    lineHeight: scaleUi(20),
+  },
+  fieldValueAction: {
+    color: "#0e3a66",
+    fontWeight: "800",
   },
   stack: {
     gap: 10,
   },
   action: {
     backgroundColor: "#e8eef7",
-    borderRadius: 16,
-    paddingVertical: 13,
-    paddingHorizontal: 16,
+    borderRadius: scaleUi(14),
+    paddingVertical: scaleUi(11),
+    paddingHorizontal: scaleUi(14),
     alignItems: "center",
   },
   actionCompact: {
     flex: 1,
-    paddingVertical: 11,
-    paddingHorizontal: 12,
+    paddingVertical: scaleUi(9),
+    paddingHorizontal: scaleUi(10),
   },
   actionPrimary: {
     backgroundColor: "#103c6d",
@@ -2038,7 +3246,7 @@ const styles = StyleSheet.create({
     opacity: 0.55,
   },
   actionText: {
-    fontSize: 16,
+    fontSize: scaleUi(14),
     fontWeight: "700",
     color: "#17395d",
   },
@@ -2067,6 +3275,84 @@ const styles = StyleSheet.create({
     textAlignVertical: "top",
     fontSize: 16,
     color: "#10253f",
+  },
+  emailSelectionList: {
+    gap: 6,
+    maxHeight: 180,
+  },
+  recipientPickerWrap: {
+    gap: 8,
+  },
+  recipientPickerToggle: {
+    alignSelf: "flex-start",
+    backgroundColor: "#edf3fa",
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: "#d5e0ee",
+  },
+  recipientPickerToggleText: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#17395d",
+  },
+  recipientPickerMenu: {
+    gap: 8,
+    backgroundColor: "#f6f9fc",
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#d7e1ee",
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+  },
+  recipientPickerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+  },
+  recipientPickerInfo: {
+    flex: 1,
+    gap: 2,
+  },
+  recipientPickerName: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#10253f",
+  },
+  recipientPickerEmail: {
+    fontSize: 11,
+    color: "#5d718d",
+  },
+  recipientPickerActions: {
+    flexDirection: "row",
+    gap: 8,
+  },
+  recipientPickerChip: {
+    minWidth: 40,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "#d5e0ee",
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  recipientPickerChipText: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#17395d",
+  },
+  emailSelectionItem: {
+    fontSize: 12,
+    lineHeight: 17,
+    color: "#445a77",
+    backgroundColor: "#f6f9fc",
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
   },
   updateBtn: {
     backgroundColor: "#103c6d",
@@ -2158,6 +3444,20 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: 10,
   },
+  queueNotice: {
+    gap: 8,
+    backgroundColor: "#f6f9fc",
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#d7e1ee",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  queueNoticeTitle: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#183659",
+  },
   photoPreview: {
     width: "100%",
     aspectRatio: 3 / 4,
@@ -2170,10 +3470,53 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#d7e1ee",
     backgroundColor: "#0c1623",
+    position: "relative",
   },
   cameraPreview: {
     width: "100%",
     aspectRatio: 3 / 4,
+  },
+  captureCueBanner: {
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    backgroundColor: "#e7f0fb",
+    borderWidth: 1,
+    borderColor: "#b9d0ea",
+  },
+  captureCueText: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: "#103c6d",
+    textAlign: "center",
+    textTransform: "uppercase",
+    letterSpacing: 0.7,
+  },
+  cameraCaptureFlash: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(255,255,255,0.7)",
+  },
+  cameraCaptureBadgeWrap: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 18,
+  },
+  cameraCaptureBadge: {
+    borderRadius: 18,
+    paddingHorizontal: 18,
+    paddingVertical: 14,
+    backgroundColor: "rgba(11, 23, 40, 0.86)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.32)",
+  },
+  cameraCaptureBadgeText: {
+    fontSize: 16,
+    fontWeight: "900",
+    color: "#ffffff",
+    textAlign: "center",
+    textTransform: "uppercase",
+    letterSpacing: 1,
   },
   photoLabelGrid: {
     flexDirection: "row",
@@ -2198,6 +3541,41 @@ const styles = StyleSheet.create({
     color: "#17395d",
   },
   photoLabelChipTextActive: {
+    color: "#ffffff",
+  },
+  zoomRow: {
+    gap: 8,
+  },
+  zoomLabel: {
+    fontSize: 12,
+    fontWeight: "800",
+    letterSpacing: 0.8,
+    color: "#577291",
+    textTransform: "uppercase",
+  },
+  zoomChipRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  zoomChip: {
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    backgroundColor: "#edf3fa",
+    borderWidth: 1,
+    borderColor: "#d5e0ee",
+  },
+  zoomChipActive: {
+    backgroundColor: "#103c6d",
+    borderColor: "#103c6d",
+  },
+  zoomChipText: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#17395d",
+  },
+  zoomChipTextActive: {
     color: "#ffffff",
   },
   photoSessionSavedList: {

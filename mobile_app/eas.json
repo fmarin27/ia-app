@@ -10,10 +10,28 @@
       "channel": "development"
     },
     "preview": {
+      "autoIncrement": true,
       "distribution": "internal",
       "channel": "preview",
       "android": {
         "buildType": "apk"
+      }
+    },
+    "joe": {
+      "distribution": "internal",
+      "channel": "joe",
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPO_PUBLIC_APP_VARIANT": "joe",
+        "EXPO_PUBLIC_APP_OWNER_NAME": "Joe Lasala",
+        "EXPO_PUBLIC_API_BASE": "https://joe-api.luxuryimportsusa.shop",
+        "EXPO_PUBLIC_API_FALLBACKS": "__NONE__",
+        "EXPO_PUBLIC_DISABLE_FONT_SCALING": "true",
+        "EXPO_PUBLIC_UI_SCALE": "0.9",
+        "EXPO_PUBLIC_LOCK_CONNECTION": "true",
+        "EXPO_PUBLIC_RELEASE_LABEL": "joe-2026.04.22.1"
       }
     },
     "production": {

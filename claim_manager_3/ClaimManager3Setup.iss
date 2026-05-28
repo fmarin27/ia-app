@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "3.0.1"
+#define AppVersion "3.0.9"
 #endif
 #ifndef SourcePortableDir
   #define SourcePortableDir "..\Releases\desktop_portable\Claim Manager 3 Portable"
@@ -33,7 +33,9 @@ RestartApplications=no
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-Source: "{#SourcePortableDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "{#SourcePortableDir}\*"; DestDir: "{app}"; Excludes: "claims_data.json,desktop_update_config.json,claims_secrets.json"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "{#SourcePortableDir}\claims_data.json"; DestDir: "{app}"; Flags: onlyifdoesntexist uninsneveruninstall
+Source: "{#SourcePortableDir}\desktop_update_config.json"; DestDir: "{app}"; Flags: onlyifdoesntexist uninsneveruninstall
 
 [Icons]
 Name: "{autodesktop}\Claim Manager 3"; Filename: "{app}\Claim Manager 3\Claim Manager 3.exe"; WorkingDir: "{app}"

@@ -50,6 +50,11 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $portableRoot = Join-Path $releaseRoot "Claim Manager 3 Portable"
+$claimToolsSourceCandidates = @(
+    (Join-Path $projectRoot "Claim Tools"),
+    (Join-Path ([Environment]::GetFolderPath("Desktop")) "Claim Tools")
+)
+$claimToolsSource = $claimToolsSourceCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 New-Item -ItemType Directory -Path $portableRoot | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $portableRoot "PENDING CLAIMS") | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $portableRoot "Closed Claims") | Out-Null
@@ -57,6 +62,10 @@ New-Item -ItemType Directory -Path (Join-Path $portableRoot "Claim Tools") | Out
 New-Item -ItemType Directory -Path (Join-Path $portableRoot "Payroll") | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $portableRoot "Office Updates") | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $portableRoot "working_sheets") | Out-Null
+
+if ($claimToolsSource) {
+    Copy-Item -Path (Join-Path $claimToolsSource "*") -Destination (Join-Path $portableRoot "Claim Tools") -Recurse -Force
+}
 
 '{}' | Set-Content -Path (Join-Path $portableRoot "claims_data.json") -Encoding UTF8
 @{

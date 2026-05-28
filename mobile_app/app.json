@@ -44,6 +44,7 @@
       "bundleIdentifier": "com.fmarin.claimmanagermobile"
     },
     "extra": {
+      "releaseLabel": "2026.04.15.3",
       "eas": {
         "projectId": "ff2bd9e5-fdc7-4dfc-b4b5-edba1573a46b"
       }

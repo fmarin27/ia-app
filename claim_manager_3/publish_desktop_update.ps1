@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "3.0.1",
+    [string]$Version = "3.0.9",
     [string]$Repo = "fmarin27/ia-app",
     [string]$ReleaseTag = "",
     [string]$ReleaseTitle = ""
@@ -29,8 +29,17 @@ if (-not (Test-Path $installerPath)) {
     throw "Installer was expected at $installerPath but was not found."
 }
 
-& gh release view $ReleaseTag --repo $Repo > $null 2>&1
-if ($LASTEXITCODE -ne 0) {
+$releaseExists = $true
+try {
+    & gh release view $ReleaseTag --repo $Repo *> $null
+    if ($LASTEXITCODE -ne 0) {
+        $releaseExists = $false
+    }
+} catch {
+    $releaseExists = $false
+}
+
+if (-not $releaseExists) {
     Write-Host "Creating GitHub release $ReleaseTag..."
     gh release create $ReleaseTag $installerPath --repo $Repo --title $ReleaseTitle --notes "Claim Manager 3 desktop installer $Version" --target $targetCommit --prerelease
 } else {

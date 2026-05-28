@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+import io
 import mimetypes
 import os
 import re
+import smtplib
+import ssl
 import sys
 import threading
+import zipfile
 from dataclasses import asdict
 from datetime import datetime
+from email.message import EmailMessage
 from email.parser import BytesParser
 from email.policy import default as email_policy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,9 +30,17 @@ try:
     from pypdf import PdfReader
 except Exception:
     PdfReader = None
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:
+    Image = None
+    ImageDraw = None
+    ImageFont = None
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("CLAIM_MANAGER_MOBILE_API_PORT", "8011"))
 DESKTOP_UPDATE_DIR = APP_DIR / "Releases" / "desktop_update_feed"
+SECRETS_FILE = APP_DIR / "claims_secrets.json"
+MOBILE_EMAIL_FROM = os.environ.get("CLAIM_MANAGER_EMAIL_FROM", "fernandomarin27@gmail.com").strip()
 IGNORED_FILE_NAMES = {"desktop.ini", "thumbs.db"}
 PHOTO_EXTENSIONS = {
     ".jpg": "image/jpeg",
@@ -36,6 +49,12 @@ PHOTO_EXTENSIONS = {
     ".heic": "image/heic",
     ".webp": "image/webp",
 }
+EMAIL_ATTACHMENT_TYPES = {
+    ".pdf": ("application", "pdf"),
+    **{ext: tuple(value.split("/", 1)) for ext, value in PHOTO_EXTENSIONS.items()},
+}
+EMAIL_ATTACHMENT_SOFT_LIMIT = 18 * 1024 * 1024
+EMAIL_ZIP_MIN_FILE_COUNT = 10
 ASSIGNMENT_MEASUREMENT_CACHE: dict[str, tuple[float, int, bool, str]] = {}
 MEASUREMENT_SCAN_STATUS = {
     "running": False,
@@ -82,6 +101,73 @@ def next_labeled_photo_path(folder: Path, label: str, suffix: str) -> Path:
         counter += 1
         candidate = folder / f"PHOTO{counter}{suffix}"
     return candidate
+
+
+def parse_client_timestamp(value: str) -> datetime | None:
+    text = clean_text(value)
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is not None:
+            return parsed.astimezone()
+        return parsed
+    except Exception:
+        return None
+
+
+def timestamp_overlay_text(captured_at: datetime | None) -> str:
+    stamp = captured_at or datetime.now().astimezone()
+    return stamp.strftime("%m/%d/%Y %I:%M:%S %p")
+
+
+def stamp_photo_timestamp(file_path: Path, captured_at: datetime | None) -> None:
+    if Image is None or ImageDraw is None or ImageFont is None:
+        return
+    suffix = file_path.suffix.lower()
+    if suffix not in PHOTO_EXTENSIONS:
+        return
+    try:
+        with Image.open(file_path) as image:
+            if image.mode not in ("RGB", "RGBA"):
+                image = image.convert("RGB")
+            else:
+                image = image.copy()
+
+            draw = ImageDraw.Draw(image)
+            font_size = max(22, int(min(image.size) * 0.03))
+            try:
+                font = ImageFont.truetype("arial.ttf", font_size)
+            except Exception:
+                font = ImageFont.load_default()
+
+            text = timestamp_overlay_text(captured_at)
+            bbox = draw.textbbox((0, 0), text, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+            padding_x = max(12, int(font_size * 0.45))
+            padding_y = max(8, int(font_size * 0.32))
+            margin = max(14, int(font_size * 0.55))
+            rect_width = text_width + padding_x * 2
+            rect_height = text_height + padding_y * 2
+            x0 = max(margin, image.width - rect_width - margin)
+            y0 = max(margin, image.height - rect_height - margin)
+            x1 = x0 + rect_width
+            y1 = y0 + rect_height
+
+            draw.rounded_rectangle((x0, y0, x1, y1), radius=max(8, int(font_size * 0.3)), fill=(0, 0, 0, 170))
+            draw.text((x0 + padding_x, y0 + padding_y - 1), text, font=font, fill=(255, 255, 255))
+
+            save_format = "JPEG"
+            if suffix == ".png":
+                save_format = "PNG"
+            elif suffix == ".webp":
+                save_format = "WEBP"
+            image.save(file_path, format=save_format, quality=92)
+    except Exception:
+        return
 
 
 def parse_multipart_file(body: bytes, content_type: str, field_name: str) -> tuple[str, str, bytes] | None:
@@ -210,6 +296,12 @@ def measurement_scan_snapshot() -> dict:
         return dict(MEASUREMENT_SCAN_STATUS)
 
 
+def format_bytes(num_bytes: int) -> str:
+    if num_bytes < 1024 * 1024:
+        return f"{max(1, round(num_bytes / 1024))} KB"
+    return f"{num_bytes / (1024 * 1024):.1f} MB"
+
+
 def _run_measurement_scan(repository: ClaimsRepository, force: bool = False) -> None:
     started_at = datetime.now().isoformat(timespec="seconds")
     with MEASUREMENT_SCAN_LOCK:
@@ -295,6 +387,16 @@ def summarize(records: list) -> dict:
     }
 
 
+def load_email_password() -> str:
+    if not SECRETS_FILE.exists():
+        return ""
+    try:
+        payload = json.loads(SECRETS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    return clean_text(payload.get("office_update_app_password"))
+
+
 class MobileApiHandler(BaseHTTPRequestHandler):
     server_version = "ClaimsMobileAPI/2.0"
     repository = ClaimsRepository()
@@ -371,6 +473,15 @@ class MobileApiHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/mobile/upload-photo":
             self._upload_photo(parsed.query)
+            return
+        if path == "/api/mobile/upload-assignment-pdf":
+            self._upload_assignment_pdf()
+            return
+        if path == "/api/mobile/delete-file":
+            self._delete_claim_file()
+            return
+        if path == "/api/mobile/send-claim-files-email":
+            self._send_claim_files_email()
             return
 
         self.send_error(404, "Not Found")
@@ -739,6 +850,7 @@ class MobileApiHandler(BaseHTTPRequestHandler):
         params = parse_qs(query)
         claim_key = unquote(clean_text(params.get("key", [""])[0]))
         requested_label = unquote(clean_text(params.get("label", [""])[0]))
+        captured_at = parse_client_timestamp(unquote(clean_text(params.get("captured_at", [""])[0])))
         claim = self._find_claim(claim_key)
         if not claim:
             self._send_json({"error": "Claim not found."}, status=404)
@@ -770,12 +882,299 @@ class MobileApiHandler(BaseHTTPRequestHandler):
 
         with destination.open("wb") as handle:
             handle.write(file_bytes)
+        stamp_photo_timestamp(destination, captured_at)
 
         self._send_json(
             {
                 "ok": True,
                 "label": normalize_photo_label(requested_label),
                 "file": self._serialize_file_entry(claim, destination, folder, self._request_base_url(), override_type=content_type),
+            }
+        )
+
+    def _upload_assignment_pdf(self) -> None:
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_length = 0
+        body = self.rfile.read(content_length) if content_length else b""
+        if not body:
+            self._send_json({"error": "No assignment PDF upload was received."}, status=400)
+            return
+
+        parsed_file = parse_multipart_file(body, self.headers.get("Content-Type", ""), "assignment")
+        if parsed_file is None:
+            self._send_json({"error": "Assignment PDF file is missing."}, status=400)
+            return
+
+        original_name, parsed_content_type, file_bytes = parsed_file
+        if not file_bytes:
+            self._send_json({"error": "Assignment PDF file is empty."}, status=400)
+            return
+        if Path(original_name).suffix.lower() != ".pdf":
+            self._send_json({"error": "Select a PDF assignment file."}, status=400)
+            return
+        normalized_content_type = clean_text(parsed_content_type).lower()
+        if normalized_content_type and normalized_content_type not in {"application/pdf", "application/octet-stream"}:
+            self._send_json({"error": "Only PDF assignment files are supported here."}, status=400)
+            return
+
+        settings = self.repository.load_settings()
+        watched_folders = [clean_text(path) for path in settings.get("watched_folders", []) if clean_text(path)]
+        pending_root = next((Path(path) for path in watched_folders if "pending" in path.lower()), None)
+        if pending_root is None:
+            self._send_json({"error": "Pending Claims folder is not configured on the Home PC."}, status=500)
+            return
+        pending_root.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(original_name).stem).strip("-") or "assign"
+        if "assign" not in safe_stem.lower():
+            safe_stem = f"assign-{safe_stem}"
+        upload_name = f"{safe_stem}-{timestamp}.pdf"
+        upload_path = pending_root / upload_name
+        counter = 1
+        while upload_path.exists():
+            counter += 1
+            upload_path = pending_root / f"{safe_stem}-{timestamp}-{counter}.pdf"
+
+        try:
+            with upload_path.open("wb") as handle:
+                handle.write(file_bytes)
+        except OSError as exc:
+            self._send_json({"error": f"Could not save assignment PDF: {exc}"}, status=500)
+            return
+
+        detected_claim_id = ""
+        detected_customer = ""
+        try:
+            details = self.repository._normalize_parsed_details(self.repository._extract_details_from_pdf(upload_path))
+            detected_claim_id = clean_text(details.get("claim_id"))
+            detected_customer = clean_text(details.get("customer_name"))
+        except Exception:
+            detected_claim_id = ""
+            detected_customer = ""
+
+        access_issues = self.repository.refresh_scan()
+        claims = self.repository.load_claims()
+        matched_claim = None
+        if detected_claim_id:
+            candidates = [claim for claim in claims if clean_text(getattr(claim, "claim_id", "")) == detected_claim_id]
+            if detected_customer:
+                normalized_customer = detected_customer.upper()
+                matched_claim = next(
+                    (
+                        claim
+                        for claim in candidates
+                        if clean_text(getattr(claim, "customer_name", "")).upper() == normalized_customer
+                    ),
+                    None,
+                )
+            if matched_claim is None and candidates:
+                candidates.sort(key=lambda claim: clean_text(getattr(claim, "updated_at", "")), reverse=True)
+                matched_claim = candidates[0]
+
+        folder_name = ""
+        if matched_claim:
+            folder = claim_folder_for(matched_claim)
+            folder_name = folder.name if folder else ""
+
+        self._send_json(
+            {
+                "ok": True,
+                "uploaded_name": upload_path.name,
+                "claim_id": detected_claim_id,
+                "customer_name": detected_customer,
+                "folder_name": folder_name,
+                "claim": self._serialize_claim_detail(matched_claim, self._request_base_url()) if matched_claim else None,
+                "access_issues": access_issues,
+            }
+        )
+
+    def _delete_claim_file(self) -> None:
+        payload = self._read_json_body()
+        if payload is None:
+            return
+
+        claim_key = clean_text(payload.get("key"))
+        relative_path = clean_text(payload.get("path"))
+        if not claim_key or not relative_path:
+            self._send_json({"error": "Claim key and file path are required."}, status=400)
+            return
+
+        claim = self._find_claim(claim_key)
+        if not claim:
+            self._send_json({"error": "Claim not found."}, status=404)
+            return
+
+        file_path = self._resolve_claim_file(claim, relative_path)
+        if not file_path:
+            self._send_json({"error": "File not found."}, status=404)
+            return
+
+        try:
+            file_path.unlink()
+        except OSError as exc:
+            self._send_json({"error": f"Could not delete file: {exc}"}, status=500)
+            return
+
+        folder = claim_folder_for(claim)
+        if folder:
+            parent = file_path.parent
+            while parent != folder:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+
+        refreshed_claim = self._find_claim(claim_key)
+        self._send_json(
+            {
+                "ok": True,
+                "deleted_path": relative_path,
+                "claim": self._serialize_claim_detail(refreshed_claim, self._request_base_url()) if refreshed_claim else None,
+            }
+        )
+
+    def _send_claim_files_email(self) -> None:
+        payload = self._read_json_body()
+        if payload is None:
+            return
+
+        claim_key = clean_text(payload.get("key"))
+        to_value = clean_text(payload.get("to"))
+        cc_value = clean_text(payload.get("cc"))
+        subject = clean_text(payload.get("subject"))
+        body_text = str(payload.get("body") or "").strip()
+        raw_paths = payload.get("paths", [])
+        if not claim_key or not to_value:
+            self._send_json({"error": "Claim key and recipient email are required."}, status=400)
+            return
+        if not isinstance(raw_paths, list) or not raw_paths:
+            self._send_json({"error": "Select at least one PDF to send."}, status=400)
+            return
+
+        claim = self._find_claim(claim_key)
+        if not claim:
+            self._send_json({"error": "Claim not found."}, status=404)
+            return
+
+        folder = claim_folder_for(claim)
+        if not folder:
+            self._send_json({"error": "Claim folder is unavailable."}, status=400)
+            return
+
+        attachments: list[Path] = []
+        seen: set[str] = set()
+        total_attachment_bytes = 0
+        for raw_path in raw_paths:
+            relative_path = clean_text(raw_path)
+            if not relative_path:
+                continue
+            file_path = self._resolve_claim_file(claim, relative_path)
+            if not file_path:
+                self._send_json({"error": f"File not found: {relative_path}"}, status=404)
+                return
+            if file_path.suffix.lower() not in EMAIL_ATTACHMENT_TYPES:
+                self._send_json(
+                    {"error": f"Only PDF and photo files can be emailed from mobile: {file_path.name}"},
+                    status=400,
+                )
+                return
+            file_key = str(file_path).lower()
+            if file_key in seen:
+                continue
+            seen.add(file_key)
+            attachments.append(file_path)
+            try:
+                total_attachment_bytes += file_path.stat().st_size
+            except OSError:
+                self._send_json({"error": f"Could not read file size for {file_path.name}."}, status=500)
+                return
+
+        if not attachments:
+            self._send_json({"error": "Select at least one file to send."}, status=400)
+            return
+
+        app_password = load_email_password()
+        if not app_password:
+            self._send_json({"error": "Email app password is not configured on the Home PC."}, status=500)
+            return
+
+        default_subject = " - ".join(
+            [part for part in (claim.claim_id, claim.customer_name or claim.title, "Claim Files") if clean_text(part)]
+        ) or "Claim Files"
+
+        message = EmailMessage()
+        message["From"] = MOBILE_EMAIL_FROM
+        message["To"] = to_value
+        if cc_value:
+            message["Cc"] = cc_value
+        message["Subject"] = subject or default_subject
+        message.set_content(body_text or "Attached are the selected claim files.")
+
+        sent_as_zip = False
+        zip_filename = ""
+        if len(attachments) >= EMAIL_ZIP_MIN_FILE_COUNT or total_attachment_bytes > EMAIL_ATTACHMENT_SOFT_LIMIT:
+            archive_buffer = io.BytesIO()
+            with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for attachment in attachments:
+                    try:
+                        relative_name = attachment.relative_to(folder)
+                    except ValueError:
+                        relative_name = Path(attachment.name)
+                    archive.writestr(str(relative_name), attachment.read_bytes())
+            archive_bytes = archive_buffer.getvalue()
+            if len(archive_bytes) > EMAIL_ATTACHMENT_SOFT_LIMIT:
+                self._send_json(
+                    {
+                        "error": (
+                            "Selected files are too large to email in one message. "
+                            f"Gmail allows about 25 MB total; this selection is roughly {format_bytes(total_attachment_bytes)}."
+                        )
+                    },
+                    status=400,
+                )
+                return
+
+            zip_filename = f"{claim.claim_id or 'claim-files'}-attachments.zip"
+            message.add_attachment(
+                archive_bytes,
+                maintype="application",
+                subtype="zip",
+                filename=zip_filename,
+            )
+            sent_as_zip = True
+        else:
+            for attachment in attachments:
+                maintype, subtype = EMAIL_ATTACHMENT_TYPES.get(attachment.suffix.lower(), ("application", "octet-stream"))
+                message.add_attachment(
+                    attachment.read_bytes(),
+                    maintype=maintype,
+                    subtype=subtype,
+                    filename=attachment.name,
+                )
+
+        try:
+            with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
+                smtp.ehlo()
+                smtp.starttls(context=ssl.create_default_context())
+                smtp.ehlo()
+                smtp.login(MOBILE_EMAIL_FROM, app_password)
+                smtp.send_message(message)
+        except (smtplib.SMTPException, OSError) as exc:
+            self._send_json({"error": f"Email send failed: {exc}"}, status=502)
+            return
+
+        self._send_json(
+            {
+                "ok": True,
+                "sent_to": to_value,
+                "attachment_count": len(attachments),
+                "attachments": [path.name for path in attachments],
+                "sent_as_zip": sent_as_zip,
+                "zip_filename": zip_filename,
             }
         )
 
@@ -801,6 +1200,7 @@ class MobileApiHandler(BaseHTTPRequestHandler):
             "key": claim.key,
             "claim_id": claim.claim_id,
             "customer_name": claim.customer_name or claim.title,
+            "contact_phone": claim.contact_phone,
             "address": route_display_address(claim),
             "shop_name": claim.shop_name,
             "town": claim.town,
@@ -823,6 +1223,7 @@ class MobileApiHandler(BaseHTTPRequestHandler):
             "customer_name": claim.customer_name or claim.title,
             "insurance_company": claim.insurance_company,
             "claim_number": claim.claim_number,
+            "contact_phone": claim.contact_phone,
             "date_of_loss": claim.date_of_loss,
             "town": claim.town,
             "shop_name": claim.shop_name,

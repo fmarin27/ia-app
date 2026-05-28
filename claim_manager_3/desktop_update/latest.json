@@ -1,6 +1,6 @@
-﻿{
-    "version":  "3.0.1",
-    "installer_file":  "Claim-Manager-3-Setup-3.0.1.exe",
-    "published_at":  "2026-04-15T00:55:51.3110876-04:00",
-    "notes":  "Desktop installer update 3.0.1"
+{
+    "version": "3.0.9",
+    "installer_file": "Claim-Manager-3-Setup-3.0.9.exe",
+    "published_at": "2026-04-27T00:00:00-04:00",
+    "notes": "Desktop installer update 3.0.9"
 }
