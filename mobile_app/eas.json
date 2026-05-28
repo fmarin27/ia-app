@@ -31,7 +31,7 @@
         "EXPO_PUBLIC_DISABLE_FONT_SCALING": "true",
         "EXPO_PUBLIC_UI_SCALE": "0.9",
         "EXPO_PUBLIC_LOCK_CONNECTION": "true",
-        "EXPO_PUBLIC_RELEASE_LABEL": "joe-2026.04.22.1"
+        "EXPO_PUBLIC_RELEASE_LABEL": "joe-2026.05.28.1"
       }
     },
     "production": {

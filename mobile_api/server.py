@@ -398,7 +398,7 @@ def load_email_password() -> str:
 
 
 class MobileApiHandler(BaseHTTPRequestHandler):
-    server_version = "ClaimsMobileAPI/2.0"
+    server_version = "ClaimsMobileAPI/2.1"
     repository = ClaimsRepository()
 
     def do_OPTIONS(self) -> None:

@@ -26,3 +26,8 @@ qt_vendor/
 CLAIMFLOW/
 FOXUSER.DBF
 FOXUSER.FPT
+build/
+Releases/desktop_installer/
+Releases/desktop_portable/
+Releases/desktop_update_feed/
+claim_ocr_*/
