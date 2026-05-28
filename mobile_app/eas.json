@@ -18,6 +18,7 @@
       }
     },
     "joe": {
+      "autoIncrement": true,
       "distribution": "internal",
       "channel": "joe",
       "android": {
