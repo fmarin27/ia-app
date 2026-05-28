@@ -872,10 +872,12 @@ class ClaimsRepository:
             return folder
 
         rename_allowed = current_name.lower() in {
+            "new folder",
+            "new claim",
             claim_id.lower(),
             f"{claim_id} - new claim".lower(),
             f"{claim_id} - {claim_id}".lower(),
-        } or current_name.lower() == preferred_name.lower()
+        } or current_name.lower() == preferred_name.lower() or bool(re.fullmatch(r"new folder \(\d+\)", current_name.lower()))
         if not rename_allowed:
             return folder
 
@@ -1709,6 +1711,17 @@ class ClaimsRepository:
                 return ""
             return cleaned
 
+        def clean_vehicle_line(value: str) -> str:
+            cleaned = clean_line(value)
+            if not cleaned:
+                return ""
+            year_match = re.match(r"^(\d{2})\s+(.+)$", cleaned)
+            if year_match:
+                year = int(year_match.group(1))
+                full_year = 2000 + year if year <= 30 else 1900 + year
+                cleaned = f"{full_year} {year_match.group(2)}"
+            return cleaned.title() if cleaned.isupper() else cleaned
+
         try:
             insurance_idx = lines.index("Insurance Information")
             if insurance_idx >= 4:
@@ -1733,15 +1746,22 @@ class ClaimsRepository:
         try:
             owner_idx = lines.index("Vehicle Owner")
             owner_block = lines[max(0, owner_idx - 8):owner_idx]
-            filtered = [line for line in owner_block if clean_line(line)]
+            filtered = [
+                line
+                for line in owner_block
+                if clean_line(line)
+                and not re.search(r"\bvehicle location\b|\bvehicle owner\b|\bvehicle information\b", line, re.IGNORECASE)
+            ]
             preferred_owner_names = [extract_name_from_owner_line(line) for line in filtered]
             preferred_owner_names = [line for line in preferred_owner_names if line]
             if preferred_owner_names:
                 customer_name = preferred_owner_names[0]
             address_lines: list[str] = []
-            for line in filtered:
+            town_line_index = -1
+            for index, line in enumerate(filtered):
                 town_match = re.search(r"\b([A-Z][A-Z ]+)\s+([A-Z]{2})\s+(\d{5})\b", line)
                 if town_match:
+                    town_line_index = index
                     town = town_match.group(1).title()
                     owner_address = " ".join(
                         part for part in [*address_lines, f"{town_match.group(1).title()}, {town_match.group(2)} {town_match.group(3)}"] if part
@@ -1757,10 +1777,17 @@ class ClaimsRepository:
                         continue
                     address_lines.append(cleaned_line.title() if cleaned_line.isupper() else cleaned_line)
             if not vehicle:
-                for line in filtered:
+                vehicle_lines = filtered[town_line_index + 1:] if town_line_index >= 0 else filtered
+                for index, line in enumerate(vehicle_lines):
                     vehicle_candidate = clean_line(line)
                     if re.match(r"^\d{2}\s+[A-Z]", vehicle_candidate, re.IGNORECASE):
-                        vehicle = vehicle_candidate.title() if vehicle_candidate.isupper() else vehicle_candidate
+                        vehicle = clean_vehicle_line(vehicle_candidate)
+                        if index + 1 < len(vehicle_lines):
+                            style_match = re.match(r"^[A-Z0-9-]+\s+([A-Z0-9][A-Z0-9 /-]{0,20})\s+Not Readable\b", vehicle_lines[index + 1], re.IGNORECASE)
+                            if style_match:
+                                style = style_match.group(1).strip()
+                                if style and style.lower() not in vehicle.lower():
+                                    vehicle = f"{vehicle} {style.upper() if style.isupper() else style}"
                         break
         except ValueError:
             pass
