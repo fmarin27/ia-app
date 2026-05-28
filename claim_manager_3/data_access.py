@@ -979,7 +979,7 @@ class ClaimsRepository:
         early_lines = "\n".join((text or "").splitlines()[:80]).lower()
         condensed = " ".join((text or "").split()).lower()
         is_total_loss = bool(
-            re.search(r"\bpossible total\b|\btotal loss\b|\btotal[-\s]?loss\b", condensed)
+            re.search(r"\bpossible total\b|\btotal[-\s]?loss\b(?!\s*:)", condensed)
         )
         supplement_patterns = (
             r"\bpreliminary supplement\b",
@@ -1105,6 +1105,8 @@ class ClaimsRepository:
             "SUPPLEMENTAL COMMENTS",
             "APPEARANCE ALLOWANCE",
             "JOB NUMBER",
+            "INSPECTION LOCATION",
+            "INSURANCE COMPANY",
         )
         if any(fragment in upper for fragment in bad_fragments):
             return True
@@ -1157,7 +1159,7 @@ class ClaimsRepository:
         elif key == "shop_name":
             if any(token in lower for token in ("auto body", "autobody", "collision", "motors", "shop", "bmw")):
                 score += 40
-            if any(token in lower for token in ("claims service", "factory service", "pre-repair", "pre-collision", "enform service")):
+            if any(token in lower for token in ("claims service", "factory service", "pre-repair", "pre-collision", "enform service", "days to repair")):
                 score -= 120
             if "," in text:
                 score -= 15
@@ -1301,7 +1303,7 @@ class ClaimsRepository:
                 details["contact_phone"] = f"{phone_digits[-10:-7]}-{phone_digits[-7:-4]}-{phone_digits[-4:]}"
         if town:
             details["town"] = town
-        if re.search(r"\bpossible total\b|\btotal loss\b", text, re.IGNORECASE):
+        if re.search(r"\bpossible total\b|\btotal[-\s]?loss\b(?!\s*:)", text, re.IGNORECASE):
             details["total_loss"] = True
         return details
 
@@ -1547,7 +1549,7 @@ class ClaimsRepository:
                 if poi_match:
                     details["damage_description"] = poi_match.group(1).strip()
 
-        if re.search(r"\bpossible total\b|\btotal loss\b", normalized_text, re.IGNORECASE):
+        if re.search(r"\bpossible total\b|\btotal[-\s]?loss\b(?!\s*:)", normalized_text, re.IGNORECASE):
             details["total_loss"] = True
 
         return details
@@ -1607,6 +1609,7 @@ class ClaimsRepository:
         shop_phone = ""
         shop_email = ""
         assignment_claim_notes = ""
+        claim_type = ""
 
         def clean_line(value: str) -> str:
             value = value.strip()
@@ -1647,6 +1650,9 @@ class ClaimsRepository:
         location_match = re.search(r"Location:\s*([^\n\r]+)", text, re.IGNORECASE)
         if location_match:
             location_of_vehicle = clean_line(location_match.group(1))
+
+        if re.search(r"(?im)^\s*SUPPLEMENT\s*$", text):
+            claim_type = "Supplement"
 
         try:
             owner_idx = lines.index("Vehicle Owner")
@@ -1789,6 +1795,7 @@ class ClaimsRepository:
             "contact_phone": contact_phone,
             "contact_email": contact_email,
             "assignment_claim_notes": assignment_claim_notes,
+            "claim_type": claim_type,
         }
 
     def _parse_generic_pdf_text(self, text: str, pdf_path: Path) -> dict[str, Any]:
@@ -1844,7 +1851,7 @@ class ClaimsRepository:
         if estimate_shop_match:
             details["shop_name"] = estimate_shop_match.group(0).strip()
 
-        if re.search(r"\bpossible total\b|\btotal loss\b", text, re.IGNORECASE):
+        if re.search(r"\bpossible total\b|\btotal[-\s]?loss\b(?!\s*:)", text, re.IGNORECASE):
             details["total_loss"] = True
 
         return details
