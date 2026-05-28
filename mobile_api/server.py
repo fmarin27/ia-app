@@ -21,8 +21,11 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 API_DIR = Path(__file__).resolve().parent
 APP_DIR = API_DIR.parent
-if str(APP_DIR) not in sys.path:
-    sys.path.insert(0, str(APP_DIR))
+CLAIM_MANAGER_DIR = APP_DIR / "claim_manager_3"
+VENDOR_DIR = CLAIM_MANAGER_DIR / "_vendor"
+for import_path in (APP_DIR, VENDOR_DIR):
+    if import_path.exists() and str(import_path) not in sys.path:
+        sys.path.insert(0, str(import_path))
 
 from claim_manager_3.data_access import ClaimsRepository
 
