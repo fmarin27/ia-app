@@ -136,6 +136,7 @@ CLAIM_SAVED_STATE_FIELDS = (
     "office_waiting_for_paperwork",
     "office_additional_notes",
 )
+ASSIGN_PARSER_VERSION = "2026-05-28.1"
 HOME_TO_LOCAL_PATH_MAP = (
     (str(HOME_APP_ROOT / "PENDING CLAIMS"), str(APP_DIR / "PENDING CLAIMS")),
     (str(HOME_APP_ROOT / "Closed Claims"), str(APP_DIR / "Closed Claims")),
@@ -672,10 +673,48 @@ class ClaimsRepository:
             if str(key).startswith("manual::") and isinstance(raw, dict):
                 discovered[str(key)] = dict(raw)
 
+        self._apply_duplicate_job_supplement_types(discovered)
         payload["claims"] = discovered
         self._save_payload(payload)
         self.sync_reference_data_from_claims(include_claim_folders=False)
         return access_issues
+
+    def _apply_duplicate_job_supplement_types(self, claims: dict[str, dict[str, Any]]) -> None:
+        jobs: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        for key, record in claims.items():
+            if not isinstance(record, dict):
+                continue
+            job_number = str(record.get("claim_id") or "").strip()
+            if not job_number:
+                continue
+            jobs.setdefault(job_number, []).append((key, record))
+
+        for entries in jobs.values():
+            if len(entries) < 2:
+                continue
+            entries.sort(key=lambda entry: self._claim_chronology_key(entry[0], entry[1]))
+            for _, record in entries[1:]:
+                manual_overrides = record.get("manual_overrides", {})
+                if isinstance(manual_overrides, dict) and "claim_type" in manual_overrides:
+                    continue
+                record["claim_type"] = "Supplement"
+
+    def _claim_chronology_key(self, key: str, record: dict[str, Any]) -> tuple[float, str, str]:
+        timestamps: list[float] = []
+        for path_text in (
+            str(record.get("assign_pdf_path") or "").strip(),
+            str(record.get("source_path") or "").strip(),
+        ):
+            if not path_text:
+                continue
+            path = Path(path_text)
+            try:
+                if path.exists():
+                    timestamps.append(path.stat().st_mtime)
+            except OSError:
+                continue
+        timestamp = min(timestamps) if timestamps else 0.0
+        return (timestamp, str(record.get("source_path") or "").lower(), key.lower())
 
     def _scan_record_is_unchanged(self, record: dict[str, Any], previous: dict[str, Any]) -> bool:
         if self._cached_record_needs_reparse(record, previous):
@@ -686,6 +725,9 @@ class ClaimsRepository:
         )
 
     def _cached_record_needs_reparse(self, record: dict[str, Any], previous: dict[str, Any]) -> bool:
+        if str(previous.get("parser_version") or "") != ASSIGN_PARSER_VERSION:
+            return True
+
         previous_customer = self._normalize_extracted_value(str(previous.get("customer_name") or ""))
         if not previous_customer:
             return True
@@ -842,6 +884,7 @@ class ClaimsRepository:
             "status": str(previous.get("status") or default_status),
             "source_path": str(item.resolve()),
             "claim_type": str(previous.get("claim_type") or self._guess_claim_type_from_name(item.name) or "Original"),
+            "parser_version": ASSIGN_PARSER_VERSION,
             "total_loss": bool(previous.get("total_loss")),
             "updated_at": datetime.fromtimestamp(item.stat().st_mtime).isoformat(timespec="seconds"),
             "closed_date": str(previous.get("closed_date") or ""),
@@ -973,16 +1016,14 @@ class ClaimsRepository:
 
     def _guess_claim_type_from_text(self, text: str, pdf_path: Path) -> str:
         name_guess = self._guess_claim_type_from_name(f"{pdf_path.name} {pdf_path.parent.name}")
-        if name_guess in {"Supplement", "Supplement Total Loss"}:
-            return name_guess
+        if "supplement" in name_guess.lower():
+            return "Supplement"
 
         early_lines = "\n".join((text or "").splitlines()[:80]).lower()
         condensed = " ".join((text or "").split()).lower()
-        is_total_loss = bool(
-            re.search(r"\bpossible total\b|\btotal[-\s]?loss\b(?!\s*:)", condensed)
-        )
         supplement_patterns = (
             r"\bpreliminary supplement\b",
+            r"(?m)^\s*supplement\s*$",
             r"\bsupplement photos?\b",
             r"\bsupplement request\b",
             r"\bsupplement estimate\b",
@@ -991,7 +1032,7 @@ class ClaimsRepository:
             r"\badditional damage\b",
         )
         if any(re.search(pattern, early_lines) for pattern in supplement_patterns):
-            return "Supplement Total Loss" if is_total_loss else "Supplement"
+            return "Supplement"
 
         original_patterns = (
             r"\boriginal estimate\b",
@@ -1000,18 +1041,16 @@ class ClaimsRepository:
             r"\bnew claim\b",
         )
         if any(re.search(pattern, condensed) for pattern in original_patterns):
-            return "Total Loss" if is_total_loss else "Original"
+            return "Original"
 
-        if is_total_loss:
-            return "Total Loss"
-
-        return name_guess
+        return "Original" if name_guess == "Original" else ""
 
     def _normalize_claim_type(self, value: str, *, allow_blank: bool = False) -> str:
         lowered = (value or "").strip().lower()
         if not lowered:
             return "" if allow_blank else "Original"
-        is_supplement = any(
+        is_supplement_original = "supplement original" in lowered
+        is_supplement = is_supplement_original or any(
             token in lowered
             for token in (
                 "supp prelim",
@@ -1022,6 +1061,7 @@ class ClaimsRepository:
                 "reinspection",
             )
         )
+        is_supplement = is_supplement or bool(re.search(r"\bsupp\b", lowered))
         is_total_loss = any(
             token in lowered
             for token in (
@@ -1034,6 +1074,8 @@ class ClaimsRepository:
             return "Supplement Total Loss"
         if is_total_loss:
             return "Total Loss"
+        if is_supplement_original:
+            return "Supplement Original"
         if is_supplement:
             return "Supplement"
         return "" if allow_blank else "Original"

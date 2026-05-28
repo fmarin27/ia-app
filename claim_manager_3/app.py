@@ -147,6 +147,7 @@ APPTRAK_PICS_DIR = Path(r"C:\AMobile\pics")
 REFRESH_SCAN_HELPER = CLAIM_MANAGER_DIR / "refresh_scan_helper.py"
 AUTOSOURCE_PDA_TEMPLATE_NAME = "Autosource_PDA_Sub_Level.pdf"
 CRAWFORD_COVER_SHEET_TEMPLATE_NAME = "Crawford cover sheet.pdf"
+CLAIM_TYPE_CHOICES = ["Original", "Supplement", "Supplement Original", "Total Loss", "Supplement Total Loss"]
 OFFICE_UPDATE_EMAIL_FROM = "fernandomarin27@gmail.com"
 OFFICE_UPDATE_EMAIL_TO = "ldellacorte@duhamels.com"
 OFFICE_UPDATE_EMAIL_CC = "joe@lasalallc.com, dnoone@duhamels.com"
@@ -1008,7 +1009,7 @@ class ClaimsDashboard(QMainWindow):
         claim_type_label = QLabel("Claim Type")
         claim_type_label.setObjectName("detailLabel")
         self.claim_type_input = QComboBox()
-        self.claim_type_input.addItems(["Original", "Supplement", "Total Loss", "Supplement Total Loss"])
+        self.claim_type_input.addItems(CLAIM_TYPE_CHOICES)
         self.claim_type_input.setObjectName("detailSelectInput")
         self.claim_type_input.setMinimumHeight(36)
         self.claim_type_input.setMinimumWidth(170)
@@ -1615,7 +1616,7 @@ class ClaimsDashboard(QMainWindow):
         office_form.setHorizontalSpacing(8)
         office_form.setVerticalSpacing(6)
         self.office_claim_type_input = QComboBox()
-        self.office_claim_type_input.addItems(["Original", "Supplement", "Total Loss", "Supplement Total Loss"])
+        self.office_claim_type_input.addItems(CLAIM_TYPE_CHOICES)
         self.office_progress_input = QComboBox()
         self.office_progress_input.addItems(
             [
