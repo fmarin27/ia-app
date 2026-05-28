@@ -64,15 +64,6 @@ function parseUiScaleValue(value, fallback = 1) {
 
 const UPDATE_CHANNEL = cleanString(Updates.channel).toLowerCase();
 const CHANNEL_PRESETS = {
-  joe: {
-    appVariant: "joe",
-    ownerName: "Joe Lasala",
-    apiBase: "https://joe-api.luxuryimportsusa.shop",
-    apiFallbacks: [],
-    disableFontScaling: true,
-    uiScale: 0.9,
-    lockConnection: true,
-  },
   production: {
     appVariant: "default",
     ownerName: "Fernando Marin",
@@ -113,7 +104,7 @@ const APP_RELEASE_LABEL =
   cleanString(appConfig?.expo?.extra?.releaseLabel) ||
   `${UPDATE_CHANNEL || "default"}-runtime`;
 const CONNECTION_HINT = CONNECTION_LOCKED
-  ? "This build is pinned to Joe's PC endpoint."
+  ? "This build is pinned to its configured endpoint."
   : "Use the secure Cloudflare address by default, or switch back to local if you are on the same network.";
 
 function scaleUi(value) {
