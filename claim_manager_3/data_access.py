@@ -126,6 +126,16 @@ LOCAL_ONLY_KEYS = {
     "office_rmc_email_to",
     "office_supplement_email_to",
 }
+CLAIM_SAVED_STATE_FIELDS = (
+    "manual_overrides",
+    "notes",
+    "note_history",
+    "route_address_override",
+    "office_progress_status",
+    "office_appt_when",
+    "office_waiting_for_paperwork",
+    "office_additional_notes",
+)
 HOME_TO_LOCAL_PATH_MAP = (
     (str(HOME_APP_ROOT / "PENDING CLAIMS"), str(APP_DIR / "PENDING CLAIMS")),
     (str(HOME_APP_ROOT / "Closed Claims"), str(APP_DIR / "Closed Claims")),
@@ -273,6 +283,103 @@ class ClaimsRepository:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    def _claim_state_aliases(self, claim_key: str, record: dict[str, Any]) -> list[str]:
+        aliases: list[str] = []
+        if claim_key:
+            aliases.append(str(claim_key))
+
+        source_path = str(record.get("source_path") or "").strip()
+        if source_path:
+            aliases.append(f"path::{source_path.lower()}")
+
+        claim_id = str(record.get("claim_id") or "").strip()
+        if claim_id:
+            aliases.append(f"id::{claim_id}")
+
+        seen: set[str] = set()
+        unique_aliases: list[str] = []
+        for alias in aliases:
+            if alias not in seen:
+                seen.add(alias)
+                unique_aliases.append(alias)
+        return unique_aliases
+
+    def _saved_claim_state(
+        self,
+        payload: dict,
+        claim_key: str,
+        record: dict[str, Any],
+    ) -> dict[str, Any]:
+        saved_state = payload.get("claim_saved_state", {})
+        if not isinstance(saved_state, dict):
+            return {}
+
+        saved_values: dict[str, Any] = {}
+        for alias in reversed(self._claim_state_aliases(claim_key, record)):
+            state_entry = saved_state.get(alias)
+            if not isinstance(state_entry, dict):
+                continue
+            for field_name in CLAIM_SAVED_STATE_FIELDS:
+                if field_name not in state_entry:
+                    continue
+                if field_name == "manual_overrides":
+                    state_overrides = state_entry.get("manual_overrides", {})
+                    if isinstance(state_overrides, dict):
+                        merged_overrides = dict(saved_values.get("manual_overrides") or {})
+                        merged_overrides.update(state_overrides)
+                        saved_values["manual_overrides"] = merged_overrides
+                else:
+                    saved_values[field_name] = state_entry[field_name]
+        return saved_values
+
+    def _saved_manual_overrides(
+        self,
+        payload: dict,
+        claim_key: str,
+        record: dict[str, Any],
+    ) -> dict[str, Any]:
+        state_values = self._saved_claim_state(payload, claim_key, record)
+        manual_overrides = state_values.get("manual_overrides", {})
+        return dict(manual_overrides) if isinstance(manual_overrides, dict) else {}
+
+    def _remember_claim_state(
+        self,
+        payload: dict,
+        claim_key: str,
+        record: dict[str, Any],
+        state_values: dict[str, Any] | None,
+    ) -> None:
+        if not state_values:
+            return
+        saved_state = payload.setdefault("claim_saved_state", {})
+        if not isinstance(saved_state, dict):
+            return
+
+        primary_entry = dict(saved_state.get(claim_key) or {})
+        for alias in self._claim_state_aliases(claim_key, record):
+            state_entry = dict(saved_state.get(alias) or primary_entry)
+            for field_name, value in state_values.items():
+                if field_name == "manual_overrides":
+                    if not isinstance(value, dict):
+                        continue
+                    state_overrides = dict(state_entry.get("manual_overrides") or {})
+                    state_overrides.update(value)
+                    state_entry["manual_overrides"] = state_overrides
+                elif field_name in CLAIM_SAVED_STATE_FIELDS:
+                    state_entry[field_name] = value
+            saved_state[alias] = state_entry
+
+    def _remember_manual_overrides(
+        self,
+        payload: dict,
+        claim_key: str,
+        record: dict[str, Any],
+        manual_overrides: dict[str, Any] | None,
+    ) -> None:
+        if not manual_overrides:
+            return
+        self._remember_claim_state(payload, claim_key, record, {"manual_overrides": manual_overrides})
 
     def _load_payload(self) -> dict:
         local_payload = self._load_local_payload()
@@ -516,8 +623,21 @@ class ClaimsRepository:
                     details = self._extract_claim_details(item)
                     if details:
                         record.update(details)
-                overrides = previous.get("manual_overrides", {})
-                if isinstance(overrides, dict):
+                saved_state_values = self._saved_claim_state(payload, key, record)
+                for field_name in CLAIM_SAVED_STATE_FIELDS:
+                    if field_name == "manual_overrides":
+                        continue
+                    if field_name in saved_state_values:
+                        record[field_name] = saved_state_values[field_name]
+                overrides = dict(saved_state_values.get("manual_overrides") or {})
+                previous_overrides = previous.get("manual_overrides", {})
+                if isinstance(previous_overrides, dict):
+                    overrides.update(previous_overrides)
+                if overrides:
+                    record["manual_overrides"] = {
+                        **dict(record.get("manual_overrides") or {}),
+                        **overrides,
+                    }
                     for field_name, value in overrides.items():
                         record[field_name] = value
                 for name_field in ("customer_name", "insured_name", "claimant_name"):
@@ -537,6 +657,15 @@ class ClaimsRepository:
                         record["source_path"] = str(item.resolve())
                         record["title"] = item.name
                         self._rekey_claim_state_entries(payload, original_key, key)
+                state_values_to_remember = {
+                    field_name: record.get(field_name)
+                    for field_name in CLAIM_SAVED_STATE_FIELDS
+                    if field_name != "manual_overrides" and field_name in saved_state_values
+                }
+                manual_overrides = dict(record.get("manual_overrides") or {})
+                if manual_overrides:
+                    state_values_to_remember["manual_overrides"] = manual_overrides
+                self._remember_claim_state(payload, key, record, state_values_to_remember)
                 discovered[key] = record
 
         for key, raw in existing_claims.items():
@@ -2027,6 +2156,7 @@ class ClaimsRepository:
         record["manual_overrides"] = manual_overrides
         state_entry["manual_overrides"] = state_overrides
         saved_state[claim_key] = state_entry
+        self._remember_manual_overrides(payload, claim_key, record, manual_overrides)
         self._save_payload(payload)
 
     def update_claim_payroll_settings(
@@ -2066,6 +2196,7 @@ class ClaimsRepository:
         record["manual_overrides"] = manual_overrides
         state_entry["manual_overrides"] = state_overrides
         saved_state[claim_key] = state_entry
+        self._remember_manual_overrides(payload, claim_key, record, manual_overrides)
         self._save_payload(payload)
 
     def append_claim_note(self, claim_key: str, note_text: str) -> None:
@@ -2093,6 +2224,12 @@ class ClaimsRepository:
         state_entry["note_history"] = note_history
         state_entry["notes"] = rendered_notes
         saved_state[claim_key] = state_entry
+        self._remember_claim_state(
+            payload,
+            claim_key,
+            record,
+            {"note_history": note_history, "notes": rendered_notes},
+        )
         self._save_payload(payload)
 
     def update_office_fields(self, claim_key: str, updates: dict[str, str]) -> None:
@@ -2119,6 +2256,7 @@ class ClaimsRepository:
         office_updates[claim_key] = office_entry
         state_entry["manual_overrides"] = state_overrides
         saved_state[claim_key] = state_entry
+        self._remember_manual_overrides(payload, claim_key, record, manual_overrides)
         self._save_payload(payload)
 
     def update_claim_status(self, claim_key: str, status: str) -> None:
@@ -2146,6 +2284,7 @@ class ClaimsRepository:
         state_overrides["status"] = status
         state_entry["manual_overrides"] = state_overrides
         saved_state[claim_key] = state_entry
+        self._remember_manual_overrides(payload, claim_key, record, manual_overrides)
         self._save_payload(payload)
 
     def move_claim_for_status(self, claim_key: str, status: str) -> str:
@@ -2202,6 +2341,7 @@ class ClaimsRepository:
         state_overrides["status"] = status
         state_entry["manual_overrides"] = state_overrides
         saved_state[new_key] = state_entry
+        self._remember_manual_overrides(payload, new_key, record, manual_overrides)
         if self._sync_reference_data_for_record(record, body_shop_entries, insurance_entries):
             payload["body_shop_database"] = [self._body_shop_entry_payload(entry) for entry in body_shop_entries]
             payload["insurance_company_database"] = [self._insurance_company_entry_payload(entry) for entry in insurance_entries]
@@ -2271,6 +2411,7 @@ class ClaimsRepository:
         state_overrides["route_address_override"] = route_address
         state_entry["manual_overrides"] = state_overrides
         saved_state[claim_key] = state_entry
+        self._remember_manual_overrides(payload, claim_key, record, manual_overrides)
         self._save_payload(payload)
 
     def _body_shop_entry_payload(self, entry: BodyShopEntry) -> dict[str, str]:
