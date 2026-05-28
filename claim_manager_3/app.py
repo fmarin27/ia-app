@@ -131,7 +131,7 @@ except Exception:
 
 
 APP_NAME = "Claim Manager 3.0"
-APP_VERSION = "3.0.10"
+APP_VERSION = "3.0.9"
 DATA_DIR = DATA_FILE.parent
 DESKTOP_UPDATE_MANIFEST_URL = "https://api2.luxuryimportsusa.shop/api/desktop-update/latest.json"
 DESKTOP_UPDATE_CONFIG_FILE = DATA_DIR / "desktop_update_config.json"
