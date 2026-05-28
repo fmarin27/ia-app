@@ -30,4 +30,5 @@ build/
 Releases/desktop_installer/
 Releases/desktop_portable/
 Releases/desktop_update_feed/
+Releases/mobile_joe/
 claim_ocr_*/
