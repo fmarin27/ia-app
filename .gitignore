@@ -1,4 +1,6 @@
 claims_secrets.json
+claims_data.json
+data_backups/
 sftp_profiles.json
 codex_bridge_config.json
 Backups/
