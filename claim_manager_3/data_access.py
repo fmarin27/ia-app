@@ -136,7 +136,6 @@ CLAIM_SAVED_STATE_FIELDS = (
     "office_waiting_for_paperwork",
     "office_additional_notes",
 )
-ASSIGN_PARSER_VERSION = "2026-05-28.1"
 HOME_TO_LOCAL_PATH_MAP = (
     (str(HOME_APP_ROOT / "PENDING CLAIMS"), str(APP_DIR / "PENDING CLAIMS")),
     (str(HOME_APP_ROOT / "Closed Claims"), str(APP_DIR / "Closed Claims")),
@@ -603,17 +602,23 @@ class ClaimsRepository:
             existing_claims = {}
 
         discovered: dict[str, dict[str, Any]] = {}
+        scanned_keys: set[str] = set()
+        scanned_roots: list[Path] = []
         access_issues: list[str] = []
+        closed_job_numbers = self._closed_folder_job_numbers(watched_folders, access_issues)
 
         for folder in watched_folders:
             folder_path = Path(folder)
             if not folder_path.exists():
                 continue
             default_status = self._default_status_for_folder(folder_path)
-            if default_status == "Open":
-                self._organize_loose_assignment_pdfs(folder_path, access_issues)
+            if default_status != "Open":
+                continue
+            scanned_roots.append(folder_path.resolve())
+            self._organize_loose_assignment_pdfs(folder_path, access_issues)
             for item in self._claim_entries_for_folder(folder_path, access_issues):
                 key = f"fs::{item.resolve()}"
+                scanned_keys.add(key)
                 original_key = key
                 previous = existing_claims.get(key, {})
                 if not isinstance(previous, dict):
@@ -670,51 +675,84 @@ class ClaimsRepository:
                 discovered[key] = record
 
         for key, raw in existing_claims.items():
-            if str(key).startswith("manual::") and isinstance(raw, dict):
+            if not isinstance(raw, dict):
+                continue
+            if str(key).startswith("manual::"):
+                discovered[str(key)] = dict(raw)
+                continue
+            if str(key) in discovered:
+                continue
+            if not self._claim_record_is_under_roots(raw, scanned_roots):
                 discovered[str(key)] = dict(raw)
 
-        self._apply_duplicate_job_supplement_types(discovered)
+        self._apply_closed_folder_supplement_types(
+            discovered,
+            eligible_keys=scanned_keys,
+            closed_job_numbers=closed_job_numbers,
+        )
         payload["claims"] = discovered
         self._save_payload(payload)
         self.sync_reference_data_from_claims(include_claim_folders=False)
         return access_issues
 
-    def _apply_duplicate_job_supplement_types(self, claims: dict[str, dict[str, Any]]) -> None:
-        jobs: dict[str, list[tuple[str, dict[str, Any]]]] = {}
-        for key, record in claims.items():
+    def _closed_folder_job_numbers(self, watched_folders: list[str], access_issues: list[str]) -> set[str]:
+        job_numbers: set[str] = set()
+        for folder in watched_folders:
+            folder_path = Path(folder)
+            if self._default_status_for_folder(folder_path) != "Closed" or not folder_path.exists():
+                continue
+            try:
+                folders = [item for item in folder_path.rglob("*") if item.is_dir()]
+            except (PermissionError, OSError):
+                access_issues.append(str(folder_path))
+                continue
+            for item in folders:
+                match = re.search(r"\b(\d{8})\b", item.name)
+                if match:
+                    job_numbers.add(match.group(1))
+        return job_numbers
+
+    def _claim_record_is_under_roots(self, record: dict[str, Any], roots: list[Path]) -> bool:
+        source_path = str(record.get("source_path") or "").strip()
+        if not source_path:
+            return False
+        try:
+            source = Path(source_path).resolve()
+        except OSError:
+            source = Path(source_path)
+
+        for root in roots:
+            try:
+                if source == root or source.is_relative_to(root):
+                    return True
+            except (OSError, ValueError):
+                root_text = str(root).rstrip("\\/").lower()
+                source_text = str(source).lower()
+                if source_text == root_text or source_text.startswith(root_text + "\\"):
+                    return True
+        return False
+
+    def _apply_closed_folder_supplement_types(
+        self,
+        claims: dict[str, dict[str, Any]],
+        *,
+        eligible_keys: set[str],
+        closed_job_numbers: set[str],
+    ) -> None:
+        if not closed_job_numbers:
+            return
+
+        for key in eligible_keys:
+            record = claims.get(key)
             if not isinstance(record, dict):
                 continue
             job_number = str(record.get("claim_id") or "").strip()
-            if not job_number:
+            if not job_number or job_number not in closed_job_numbers:
                 continue
-            jobs.setdefault(job_number, []).append((key, record))
-
-        for entries in jobs.values():
-            if len(entries) < 2:
+            manual_overrides = record.get("manual_overrides", {})
+            if isinstance(manual_overrides, dict) and "claim_type" in manual_overrides:
                 continue
-            entries.sort(key=lambda entry: self._claim_chronology_key(entry[0], entry[1]))
-            for _, record in entries[1:]:
-                manual_overrides = record.get("manual_overrides", {})
-                if isinstance(manual_overrides, dict) and "claim_type" in manual_overrides:
-                    continue
-                record["claim_type"] = "Supplement"
-
-    def _claim_chronology_key(self, key: str, record: dict[str, Any]) -> tuple[float, str, str]:
-        timestamps: list[float] = []
-        for path_text in (
-            str(record.get("assign_pdf_path") or "").strip(),
-            str(record.get("source_path") or "").strip(),
-        ):
-            if not path_text:
-                continue
-            path = Path(path_text)
-            try:
-                if path.exists():
-                    timestamps.append(path.stat().st_mtime)
-            except OSError:
-                continue
-        timestamp = min(timestamps) if timestamps else 0.0
-        return (timestamp, str(record.get("source_path") or "").lower(), key.lower())
+            record["claim_type"] = "Supplement"
 
     def _scan_record_is_unchanged(self, record: dict[str, Any], previous: dict[str, Any]) -> bool:
         if self._cached_record_needs_reparse(record, previous):
@@ -725,9 +763,6 @@ class ClaimsRepository:
         )
 
     def _cached_record_needs_reparse(self, record: dict[str, Any], previous: dict[str, Any]) -> bool:
-        if str(previous.get("parser_version") or "") != ASSIGN_PARSER_VERSION:
-            return True
-
         previous_customer = self._normalize_extracted_value(str(previous.get("customer_name") or ""))
         if not previous_customer:
             return True
@@ -884,7 +919,6 @@ class ClaimsRepository:
             "status": str(previous.get("status") or default_status),
             "source_path": str(item.resolve()),
             "claim_type": str(previous.get("claim_type") or self._guess_claim_type_from_name(item.name) or "Original"),
-            "parser_version": ASSIGN_PARSER_VERSION,
             "total_loss": bool(previous.get("total_loss")),
             "updated_at": datetime.fromtimestamp(item.stat().st_mtime).isoformat(timespec="seconds"),
             "closed_date": str(previous.get("closed_date") or ""),
