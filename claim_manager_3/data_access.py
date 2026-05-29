@@ -381,6 +381,38 @@ class ClaimsRepository:
             return
         self._remember_claim_state(payload, claim_key, record, {"manual_overrides": manual_overrides})
 
+    def _forget_manual_override_fields(
+        self,
+        payload: dict,
+        claim_key: str,
+        record: dict[str, Any],
+        field_names: set[str],
+    ) -> None:
+        if not field_names:
+            return
+        saved_state = payload.get("claim_saved_state", {})
+        if not isinstance(saved_state, dict):
+            return
+        for alias in self._claim_state_aliases(claim_key, record):
+            state_entry = saved_state.get(alias)
+            if not isinstance(state_entry, dict):
+                continue
+            state_overrides = state_entry.get("manual_overrides", {})
+            if not isinstance(state_overrides, dict):
+                continue
+            changed = False
+            for field_name in field_names:
+                if field_name in state_overrides:
+                    state_overrides.pop(field_name, None)
+                    changed = True
+            if not changed:
+                continue
+            if state_overrides:
+                state_entry["manual_overrides"] = state_overrides
+            else:
+                state_entry.pop("manual_overrides", None)
+            saved_state[alias] = state_entry
+
     def _load_payload(self) -> dict:
         local_payload = self._load_local_payload()
         if not OFFICE_SYNC_ENABLED:
@@ -646,6 +678,14 @@ class ClaimsRepository:
                     }
                     for field_name, value in overrides.items():
                         record[field_name] = value
+                if default_status == "Open":
+                    record["status"] = "Open"
+                    record["closed_date"] = ""
+                    manual_overrides = dict(record.get("manual_overrides") or {})
+                    manual_overrides.pop("status", None)
+                    manual_overrides.pop("closed_date", None)
+                    record["manual_overrides"] = manual_overrides
+                    self._forget_manual_override_fields(payload, key, record, {"status", "closed_date"})
                 for name_field in ("customer_name", "insured_name", "claimant_name"):
                     normalized_name = self._normalize_customer_name(str(record.get(name_field) or ""))
                     if normalized_name:
@@ -659,6 +699,8 @@ class ClaimsRepository:
                     if upgraded_item != item:
                         item = upgraded_item
                         key = f"fs::{item.resolve()}"
+                        scanned_keys.discard(original_key)
+                        scanned_keys.add(key)
                         record["key"] = key
                         record["source_path"] = str(item.resolve())
                         record["title"] = item.name
@@ -1722,6 +1764,34 @@ class ClaimsRepository:
                 cleaned = f"{full_year} {year_match.group(2)}"
             return cleaned.title() if cleaned.isupper() else cleaned
 
+        def clean_date(value: str) -> str:
+            match = re.match(r"\s*(\d{1,2})/(\d{1,2})/(\d{2,4})\b", value)
+            if not match:
+                return clean_line(value)
+            month = int(match.group(1))
+            day = int(match.group(2))
+            year = match.group(3)[-2:]
+            return f"{month:02d}/{day:02d}/{year}"
+
+        def phone_from_line(value: str) -> str:
+            match = re.search(r"\(?(\d{3})\)?[-.\s]*(\d{3})[-.\s]*(\d{4})", value)
+            if not match:
+                return ""
+            return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+
+        def looks_like_city_state_zip(value: str) -> bool:
+            return bool(re.search(r"\b[A-Z][A-Z .'\-]+\s+[A-Z]{2}\s+\d{5}(?:-\d{4})?\b", value))
+
+        def looks_like_shop_name(value: str) -> bool:
+            cleaned = clean_line(value)
+            if not cleaned:
+                return False
+            if re.search(r"\d|@", cleaned):
+                return False
+            if re.fullmatch(r"[A-Z][A-Z .'\-&/]+", cleaned):
+                return True
+            return any(token in cleaned.lower() for token in ("auto", "body", "collision", "garage", "service", "repair"))
+
         try:
             insurance_idx = lines.index("Insurance Information")
             if insurance_idx >= 4:
@@ -1732,9 +1802,14 @@ class ClaimsRepository:
         except ValueError:
             pass
 
-        date_match = re.search(r"(\d{2}/\d{2}/\d{2})\s+Date of Loss:", text)
-        if date_match:
-            date_of_loss = date_match.group(1)
+        for date_pattern in (
+            r"(\d{1,2}/\d{1,2}/\d{2,4})\s+Date of Loss:",
+            r"Date of Loss:\s*(\d{1,2}/\d{1,2}/\d{2,4})",
+        ):
+            date_match = re.search(date_pattern, text, re.IGNORECASE)
+            if date_match:
+                date_of_loss = clean_date(date_match.group(1))
+                break
 
         location_match = re.search(r"Location:\s*([^\n\r]+)", text, re.IGNORECASE)
         if location_match:
@@ -1792,7 +1867,7 @@ class ClaimsRepository:
         except ValueError:
             pass
 
-        owner_role_match = re.search(r"\((Claimant|Insured)\)\s+([A-Z][A-Z .'\-]+)$", text, re.IGNORECASE | re.MULTILINE)
+        owner_role_match = re.search(r"\((Claimant|Insured)\)[ \t]+([A-Z][A-Z .'\-]+)$", text, re.IGNORECASE | re.MULTILINE)
         if owner_role_match:
             owner_role = owner_role_match.group(1).lower()
             owner_name = clean_line(owner_role_match.group(2).title() if owner_role_match.group(2).isupper() else owner_role_match.group(2))
@@ -1815,23 +1890,68 @@ class ClaimsRepository:
                 if line == vin and index > 0:
                     vehicle_line = lines[index - 1]
                     if not vehicle_line.endswith(":"):
-                        vehicle = vehicle_line
+                        vehicle = clean_vehicle_line(vehicle_line)
+                        if index + 1 < len(lines):
+                            style_line = clean_line(lines[index + 1])
+                            if (
+                                style_line
+                                and not style_line.endswith(":")
+                                and not re.search(r"\b(vehicle owner|vehicle information|home ph|work ph|model|vin|plate|style|mileage|damage|make)\b", style_line, re.IGNORECASE)
+                                and re.fullmatch(r"[A-Z0-9][A-Z0-9 /.'\-]{1,30}", style_line)
+                            ):
+                                style_text = style_line.title() if style_line.isupper() else style_line
+                                if style_text.lower() not in vehicle.lower():
+                                    vehicle = f"{vehicle} {style_text}"
                     break
 
         damage_match = re.search(r"Damage:\s*([^\n\r]+)", text, re.IGNORECASE)
         if damage_match:
             damage_description = clean_line(damage_match.group(1))
+        if not damage_description or damage_description.lower() in {"make", "make:"}:
+            try:
+                damage_idx = lines.index("Damage:")
+            except ValueError:
+                damage_idx = -1
+            if damage_idx >= 0:
+                for follow_line in lines[damage_idx + 1:damage_idx + 8]:
+                    candidate = clean_line(follow_line)
+                    if not candidate or candidate.endswith(":"):
+                        continue
+                    damage_description = candidate
+                    break
 
         facts_match = re.search(r"Facts of Loss:\s*([^\n\r]+)", text, re.IGNORECASE)
         if facts_match:
             facts_of_loss = clean_line(facts_match.group(1))
+        if facts_match and len(facts_of_loss.split()) <= 2:
+            facts_tail = text[facts_match.end():]
+            stop_match = re.search(
+                r"(?:^|\W|\d)(Impact\s+Notes|Appraisal\s+Notes|Registration\s+Expiration|Inspection\s+Number)\s*:",
+                facts_tail,
+                re.IGNORECASE,
+            )
+            facts_block = facts_tail[: stop_match.start()] if stop_match else facts_tail[:300]
+            facts_of_loss = clean_line(f"{facts_of_loss} {' '.join(facts_block.split())}")
 
         shop_match = re.search(r"\(\s*[A-Z0-9]+\s*\)\s*\n([^\n]+)\n([^\n]+)\n([^\n]+)\n([\d-]+)", text)
         if shop_match:
             shop_name = clean_line(shop_match.group(1))
             shop_phone = clean_line(shop_match.group(4))
+        if not shop_name:
+            for index, line in enumerate(lines[:-4]):
+                if not re.fullmatch(r"\(\s*[A-Z0-9]*\s*\)", line):
+                    continue
+                candidate_name = clean_line(lines[index + 1])
+                candidate_city = clean_line(lines[index + 3])
+                candidate_phone = phone_from_line(lines[index + 4])
+                if looks_like_shop_name(candidate_name) and looks_like_city_state_zip(candidate_city) and candidate_phone:
+                    shop_name = candidate_name
+                    shop_phone = candidate_phone
+                    break
         if location_of_vehicle and not shop_name:
             shop_name = location_of_vehicle
+        if shop_name and not location_of_vehicle:
+            location_of_vehicle = shop_name
 
         appraisal_idx = next((idx for idx, value in enumerate(lines) if value.lower().startswith("appraisal notes:")), -1)
         claimant_context = lines[max(0, appraisal_idx - 14):min(len(lines), appraisal_idx + 10)] if appraisal_idx >= 0 else []
@@ -1875,6 +1995,8 @@ class ClaimsRepository:
             if note_lines:
                 assignment_claim_notes = " ".join(note_lines).strip()
                 break
+        if assignment_claim_notes.lower().rstrip(":") in {"appraisal notes", "instructions to estimator"}:
+            assignment_claim_notes = ""
 
         return {
             "assign_pdf_path": str(pdf_path),
